@@ -1,0 +1,45 @@
+<idea-plugin>
+    <id>com.lioncph.plugin</id>
+    <name>LionCPH</name>
+    <vendor email="mszashrafmusameh2021@gmail.com" url="https://github.com/mostafa16musameh/LionCPH">Mostafa Musameh</vendor>
+
+    <description><![CDATA[
+        <p><b>LionCPH</b> brings the speed and workflow of VS Code's Competitive Programming Helper (CPH) natively to CLion.</p>
+        <ul>
+            <li><b>Instant Compile &amp; Judge:</b> Parallel testcase execution, smart compile caching, signal diagnostics (SIGSEGV, Stack Overflow, TLE), and first-line diff hints.</li>
+            <li><b>Competitive Companion Integration:</b> Automatically imports problems and sample testcases on ports 27121 &amp; 10045.</li>
+            <li><b>Zero-Config CMake Auto-Sync:</b> Automatically registers LionCPH-imported files in an isolated <code>.cph/lioncph_targets.cmake</code> and reloads CMake without touching user files.</li>
+            <li><b>Smart Codeforces Submit:</b> Matches your CLion C++ standard to Codeforces languages with human pre-submit verification, working both with and without the <code>cph-submit</code> browser extension.</li>
+            <li><b>Custom Checker &amp; ONLINE_JUDGE:</b> Python Special Judge support and one-click <code>ONLINE_JUDGE</code> / <code>LOCAL</code> macro syncing.</li>
+        </ul>
+    ]]></description>
+
+    <change-notes><![CDATA[
+        <ul>
+            <li><b>1.5.3:</b> Fixed cph-submit idle polling (returns HTTP 404 when no submission is queued) to guarantee zero unintended browser tabs.</li>
+            <li><b>1.5.2:</b> Full resource &amp; thread-pool hygiene, multi-window CLion support, Stop button for single-test runs, Gson upgrade safety, Codeforces EDU support, and hardened CMake GLOB detection.</li>
+            <li><b>1.4.x:</b> Pixel-faithful CPH UI, instant trash delete, isolated CMake auto-sync with reload, and dual-mode smart Codeforces Submit (with cph-submit IPv6/IPv4 support).</li>
+        </ul>
+    ]]></change-notes>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.clion</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow
+            id="LionCPH"
+            anchor="right"
+            icon="/icons/lioncph.svg"
+            factoryClass="com.lioncph.plugin.ui.LionCPHToolWindowFactory"/>
+    </extensions>
+
+    <actions>
+        <action
+            id="LionCPH.RunAll"
+            class="com.lioncph.plugin.ui.RunAllAction"
+            text="LionCPH: Run All Testcases"
+            description="Compile and run all LionCPH testcases for the active C++ file">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt B"/>
+        </action>
+    </actions>
+</idea-plugin>

@@ -1,0 +1,17 @@
+# Gradle & IntelliJ Platform build artifacts
+.gradle/
+build/
+out/
+.intellijPlatform/
+.kotlin/
+
+# IDE files
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Local CPH cache & OS files
+.cph/
+.DS_Store
+Thumbs.db
