@@ -12,8 +12,12 @@ data class CfLanguage(
 
 data class CfProblemRef(
     val displayLabel: String,
+    val contestId: Int?,
     val problemIndex: String,
-    val directSubmitUrl: String
+    val problemBaseUrl: String,
+    val directSubmitUrl: String,
+    val mySubmissionsUrl: String,
+    val standingsUrl: String
 )
 
 object CodeforcesSubmitService {
@@ -24,31 +28,25 @@ object CodeforcesSubmitService {
         CfLanguage(54, "GNU G++17 7.3.0")
     )
 
-    /**
-     * Detects the C++ standard from CMakeLists.txt or LionCPH compiler args
-     * and maps it to the exact matching Codeforces languageId.
-     */
     fun resolveCodeforcesLanguage(projectRoot: Path, settings: CphSettings): CfLanguage {
         val overrideId = settings.cfLanguageOverride.trim().toIntOrNull()
         if (overrideId != null) {
             SUPPORTED_LANGUAGES.find { it.id == overrideId }?.let { return it }
         }
 
-        // 1. Check CMakeLists.txt CMAKE_CXX_STANDARD first (matches CLion's active project standard)
         val cmakeFile = projectRoot.resolve("CMakeLists.txt")
         if (Files.isRegularFile(cmakeFile)) {
             runCatching {
                 val cmake = Files.readString(cmakeFile, StandardCharsets.UTF_8)
                 val match = Regex("""CMAKE_CXX_STANDARD\s+(\d{2})""").find(cmake)
                 when (match?.groupValues?.get(1)) {
-                    "23", "26" -> return SUPPORTED_LANGUAGES[0] // G++23
-                    "20" -> return SUPPORTED_LANGUAGES[1]       // G++20
-                    "17" -> return SUPPORTED_LANGUAGES[2]       // G++17 (64 bit)
+                    "23", "26" -> return SUPPORTED_LANGUAGES[0]
+                    "20" -> return SUPPORTED_LANGUAGES[1]
+                    "17" -> return SUPPORTED_LANGUAGES[2]
                 }
             }
         }
 
-        // 2. Fallback to LionCPH compiler flags
         val args = settings.compilerArgs.lowercase()
         return when {
             args.contains("c++23") || args.contains("gnu++23") -> SUPPORTED_LANGUAGES[0]
@@ -57,73 +55,96 @@ object CodeforcesSubmitService {
         }
     }
 
-    /**
-     * Parses any Codeforces problem URL (contest, problemset, gym, group)
-     * and builds the exact direct Submit URL for that specific problem.
-     */
     fun parseCodeforcesUrl(url: String): CfProblemRef? {
         val trimmed = url.trim()
         if (!trimmed.contains("codeforces.com", ignoreCase = true)) return null
 
-        // EDU practice: https://codeforces.com/edu/course/<c>/lesson/<l>/practice/contest/<id>/problem/<index>
+        // EDU practice
         Regex("""(https?://[^/]*codeforces\.com/edu/course/\d+/lesson/[^/]+/practice/contest/(\d+))/problem/([A-Za-z0-9]+)""", RegexOption.IGNORE_CASE)
             .find(trimmed)?.let { m ->
                 val (prefix, contestId, index) = m.destructured
                 return CfProblemRef(
                     displayLabel = "EDU Contest $contestId — Problem $index",
+                    contestId = contestId.toIntOrNull(),
                     problemIndex = index,
-                    directSubmitUrl = "$prefix/submit?submittedProblemIndex=$index"
+                    problemBaseUrl = "$prefix/problem/",
+                    directSubmitUrl = "$prefix/submit?submittedProblemIndex=$index",
+                    mySubmissionsUrl = "$prefix/my",
+                    standingsUrl = "$prefix/standings"
                 )
             }
 
-        // Group contest: https://codeforces.com/group/<groupId>/contest/<contestId>/problem/<index>
+        // Group contest
         Regex("""codeforces\.com/group/([^/]+)/contest/(\d+)/problem/([A-Za-z0-9]+)""", RegexOption.IGNORE_CASE)
             .find(trimmed)?.let { m ->
                 val (groupId, contestId, index) = m.destructured
+                val base = "https://codeforces.com/group/$groupId/contest/$contestId"
                 return CfProblemRef(
                     displayLabel = "Group $groupId / Contest $contestId — Problem $index",
+                    contestId = contestId.toIntOrNull(),
                     problemIndex = index,
-                    directSubmitUrl = "https://codeforces.com/group/$groupId/contest/$contestId/submit?submittedProblemIndex=$index"
+                    problemBaseUrl = "$base/problem/",
+                    directSubmitUrl = "$base/submit?submittedProblemIndex=$index",
+                    mySubmissionsUrl = "$base/my",
+                    standingsUrl = "$base/standings"
                 )
             }
 
-        // Standard contest: https://codeforces.com/contest/<contestId>/problem/<index>
+        // Standard contest
         Regex("""codeforces\.com/contest/(\d+)/problem/([A-Za-z0-9]+)""", RegexOption.IGNORE_CASE)
             .find(trimmed)?.let { m ->
                 val (contestId, index) = m.destructured
+                val base = "https://codeforces.com/contest/$contestId"
                 return CfProblemRef(
                     displayLabel = "Contest $contestId — Problem $index",
+                    contestId = contestId.toIntOrNull(),
                     problemIndex = index,
-                    directSubmitUrl = "https://codeforces.com/contest/$contestId/submit?submittedProblemIndex=$index"
+                    problemBaseUrl = "$base/problem/",
+                    directSubmitUrl = "$base/submit?submittedProblemIndex=$index",
+                    mySubmissionsUrl = "$base/my",
+                    standingsUrl = "$base/standings"
                 )
             }
 
-        // Gym: https://codeforces.com/gym/<gymId>/problem/<index>
+        // Gym
         Regex("""codeforces\.com/gym/(\d+)/problem/([A-Za-z0-9]+)""", RegexOption.IGNORE_CASE)
             .find(trimmed)?.let { m ->
                 val (gymId, index) = m.destructured
+                val base = "https://codeforces.com/gym/$gymId"
                 return CfProblemRef(
                     displayLabel = "Gym $gymId — Problem $index",
+                    contestId = gymId.toIntOrNull(),
                     problemIndex = index,
-                    directSubmitUrl = "https://codeforces.com/gym/$gymId/submit?submittedProblemIndex=$index"
+                    problemBaseUrl = "$base/problem/",
+                    directSubmitUrl = "$base/submit?submittedProblemIndex=$index",
+                    mySubmissionsUrl = "$base/my",
+                    standingsUrl = "$base/standings"
                 )
             }
 
-        // Problemset: https://codeforces.com/problemset/problem/<contestId>/<index>
+        // Problemset
         Regex("""codeforces\.com/problemset/problem/(\d+)/([A-Za-z0-9]+)""", RegexOption.IGNORE_CASE)
             .find(trimmed)?.let { m ->
                 val (contestId, index) = m.destructured
                 return CfProblemRef(
                     displayLabel = "Problemset $contestId$index",
+                    contestId = contestId.toIntOrNull(),
                     problemIndex = index,
-                    directSubmitUrl = "https://codeforces.com/problemset/submit?submittedProblemCode=$contestId$index"
+                    problemBaseUrl = "https://codeforces.com/problemset/problem/$contestId/",
+                    directSubmitUrl = "https://codeforces.com/problemset/submit?submittedProblemCode=$contestId$index",
+                    mySubmissionsUrl = "https://codeforces.com/problemset/status?my=on",
+                    standingsUrl = "https://codeforces.com/problemset"
                 )
             }
 
         return CfProblemRef(
             displayLabel = trimmed,
+            contestId = null,
             problemIndex = "",
-            directSubmitUrl = trimmed
+            problemBaseUrl = "",
+            directSubmitUrl = trimmed,
+            mySubmissionsUrl = "https://codeforces.com/problemset/status?my=on",
+                    standingsUrl = "https://codeforces.com/problemset"
         )
     }
 }

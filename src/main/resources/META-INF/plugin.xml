@@ -6,16 +6,38 @@
     <description><![CDATA[
         <p><b>LionCPH</b> brings the speed and workflow of VS Code's Competitive Programming Helper (CPH) natively to CLion.</p>
         <ul>
-            <li><b>Instant Compile &amp; Judge:</b> Parallel testcase execution, smart compile caching, signal diagnostics (SIGSEGV, Stack Overflow, TLE), and first-line diff hints.</li>
-            <li><b>Competitive Companion Integration:</b> Automatically imports problems and sample testcases on ports 27121 &amp; 10045.</li>
-            <li><b>Zero-Config CMake Auto-Sync:</b> Automatically registers LionCPH-imported files in an isolated <code>.cph/lioncph_targets.cmake</code> and reloads CMake without touching user files.</li>
-            <li><b>Smart Codeforces Submit:</b> Matches your CLion C++ standard to Codeforces languages with human pre-submit verification, working both with and without the <code>cph-submit</code> browser extension.</li>
-            <li><b>Custom Checker &amp; ONLINE_JUDGE:</b> Python Special Judge support and one-click <code>ONLINE_JUDGE</code> / <code>LOCAL</code> macro syncing.</li>
+            <li><b>Instant Compile, Judge &amp; Debug:</b> Parallel testcase execution, smart compile caching, One-Click <b>Debug TC</b> in CLion Debugger, <b>Sanitizers</b> (ASan/UBSan + MinGW STL debug fallback), Memory (MB/KB) &amp; MLE tracking, signal diagnostics, and side-by-side <b>Colored Visual Diff</b>.</li>
+            <li><b>Full Codeforces Hub:</b> Ultra-fast <b>Live Verdicts</b> (with Group API Key/Secret support), in-IDE <b>CF Submissions</b> &amp; <b>Upcoming Contests</b>, smart <b>Prev / Standings / Next</b> navigator with automatic end-of-sheet detection, and dual-mode Smart Submit.</li>
+            <li><b>Smart Workspace Organizer &amp; Template Editor:</b> Automatically organizes problems into <code>Groups/&lt;Group&gt;/&lt;Sheet&gt;</code>, <code>Contests</code>, <code>EDU</code>, <code>Gym</code>, or <code>Practice</code> folders with isolated CMake auto-sync and customizable C++ templates.</li>
+            <li><b>Competitive Companion &amp; Custom Checker:</b> Auto-imports from 100+ judges on ports 27121 &amp; 10045, Python Special Judge support, and one-click <code>ONLINE_JUDGE</code> / <code>LOCAL</code> macro syncing.</li>
         </ul>
+        <p><b>Credits &amp; Special Thanks:</b> Created by <b>Mostafa Musameh</b>, with sincere thanks to <b>Tariq Khalid</b> (<a href="https://github.com/Tariq4824">@Tariq4824</a>) — <i>QA &amp; Testing Contributor</i> — for his dedicated testing, bug reports, and thoughtful feedback.</p>
     ]]></description>
 
     <change-notes><![CDATA[
         <ul>
+            <li><b>1.9.2:</b> Safe red Trash button — offers <b>Clear Results Only</b> (keeps all testcases) or <b>Delete Problem</b> with an automatic backup and a 1-click <b>Restore Deleted Problem</b> button so testcases are never accidentally lost.</li>
+            <li><b>1.9.1:</b> Pinned sticky bottom Control Dock (<code>+ New Testcase</code>, <code>Submit</code>, <code>Judge Options</code>, 3x3 Tools Grid, <code>Note</code>, and <code>Run All</code>) right at the bottom of the panel so the center zone is dedicated purely to scrolling testcases with zero empty dead space.</li>
+            <li><b>1.9.0:</b> Minimalist JetBrains-grade UI polish — consolidated <b>Judge Options</b> (<code>ONLINE_JUDGE</code>, <code>Sanitizers</code>, <code>Float Tolerance</code>, and calmed <code>Custom Checker</code>) into a single sleek collapsible bar with live status summary, trimmed the sticky header, softened card borders, and added subtle placeholder styling to <b>Problem Notes</b>.</li>
+            <li><b>1.8.6:</b> Smart <b>Auto Float Tolerance</b> (automatically detects precision from problem statements &amp; decimal sample outputs, plus full user control: Auto / Exact / 1e-4 / 1e-6 / 1e-9 / Custom), and dynamic visual state for the Stopwatch <b>Reset</b> button (dimmed at 00:00, amber while running, bright when paused with elapsed time).</li>
+            <li><b>1.8.5:</b> Fixed Codeforces Group name detection — extracts the real group name from the Codeforces sidebar link (<code>/group/&lt;id&gt;</code>) and ignores generic <code>Contests</code> page titles.</li>
+            <li><b>1.8.4:</b> Responsive narrow-sidebar polish — fixed overlapping timer &amp; navigation buttons via GridBag/Grid layouts, fixed clipped <code>Sanitizers</code> &amp; <code>Float Tolerance</code> controls, pinned the Open Problem web icon left of the title, and tightened 3x3 grid labels so nothing truncates with <code>...</code>.</li>
+            <li><b>1.8.3:</b> Fixed IntelliJ/CLion 2026.3 strict threading exception (<code>Access is allowed from write thread only</code>) when clicking <b>Organize</b> or <b>Rename Group Folder</b> by switching VFS refreshes to asynchronous mode.</li>
+            <li><b>1.8.2:</b> Smart Group ID resolution (maps <code>MWSDmqGsZm</code> to <code>ICPC_Assiut_University_Community</code> and auto-fetches real names for any Codeforces Group), fixes split sheet folders under <code>Groups/</code>, adds one-click <b>Rename Group Folder</b>, and recursively cleans/re-sorts existing folders on <b>Organize</b>.</li>
+            <li><b>1.8.1:</b> Real-time <b>Codeforces Live &amp; Virtual Contest Timer Sync</b> (uses server-relative epoch timestamps for zero drift), fixed timer button text truncation (dynamic width), and dedicated <code>Problemset/</code> + cleaner <code>Groups/&lt;Group&gt;/&lt;Sheet&gt;</code> &amp; <code>Contests/&lt;Contest&gt;</code> folder organization.</li>
+            <li><b>1.8.0:</b> Major Competitive Programming Upgrade — added Dual Sticky Timer (per-problem Stopwatch with auto-pause on AC + Contest/Virtual/Sheet Countdown), <b>Float Tolerance</b> comparison (Exact / 1e-6 / 1e-9), <b>Pre-Submit Safety Guard</b> (freopen / endl / debug check), <b>CP Snippets Library</b> (insert DSU, SegTree, Sieve, Dijkstra &amp; custom templates at cursor), <b>Batch .in/.out Folder Importer</b>, quick <b>Problem Notes</b> for upsolving, and crystal-clear 3x3 button labels.</li>
+            <li><b>1.7.6:</b> Pinned sticky top header (problem title, Open Problem, Collapse All, passed counter, folder breadcrumb, and Codeforces Prev/Standings/Next bar) so key controls stay visible while scrolling large testcase lists.</li>
+            <li><b>1.7.5:</b> Redesigned 3x3 action grid with zero duplicate buttons (added <b>Set URL</b>, one-click <b>Organize</b>, <b>GitHub</b>, and <b>About</b>), instant Codeforces navigation refresh when editing problem URLs, safer cross-drive file moving in Workspace Organizer, and a cleaner Settings dialog.</li>
+            <li><b>1.7.4:</b> Clearer labeled navigation buttons (Prev / Standings / Next / Last Problem), automatic end-of-sheet detection (never creates bogus files past the last problem), and zero duplicate tabs on existing files.</li>
+            <li><b>1.7.3:</b> Smart tab-spam prevention on Prev/Next navigation (existing local files open directly in CLion without duplicating browser tabs; new problems open once automatically) plus a quick Open Problem icon right beside the problem title.</li>
+            <li><b>1.7.2:</b> Smart Workspace Organizer (3 modes: Flat, Single Folder, or Smart Hierarchy for Groups/Sheets, Contests, EDU, Gym, Practice, AtCoder/CSES), Short vs. Full file naming style, live folder breadcrumb, unique subfolder CMake target naming, and one-click <b>Organize Existing Root Files</b>.</li>
+            <li><b>1.7.1:</b> Added one-click <b>Collapse All / Expand All</b> toggle in the header, fixed Custom Checker box clipping &amp; chevron direction, and added scrollable Compilation Error panel with one-click Copy.</li>
+            <li><b>1.7.0:</b> Dedicated C++ Template Editor, optional Contest/Sheet/Practice auto-folder organization (with full CMake support), Memory usage (MB/KB) &amp; MLE diagnostics, refined sleek navigation bar (zero duplicate buttons), and tuned 2x smooth mouse-wheel scrolling.</li>
+            <li><b>1.6.4:</b> 3x faster &amp; smoother mouse-wheel scrolling across large testcase lists, and automatic Codeforces API fallback with clear error diagnostics.</li>
+            <li><b>1.6.3:</b> Modern refined dark UI with rounded cards and cleaner navigation bar, plus auto-create &amp; sample testcase fetching when clicking Next/Prev problem.</li>
+            <li><b>1.6.2:</b> Full Codeforces Hub inside CLion — in-IDE <b>CF Submissions</b> table, <b>Upcoming Contests</b> countdown viewer, one-click <b>Standings</b>, and ultra-fast (~1.1s) smart-backoff Live Verdicts with Group API Key/Secret support.</li>
+            <li><b>1.6.1:</b> Smart Codeforces Problem Navigator (Prev / Next problem in CLion &amp; browser with automatic <b>Last Problem</b> detection, one-click My Submissions), plus fast 2-second authenticated Live Verdicts supporting Codeforces Groups (API Key &amp; Secret).</li>
+            <li><b>1.6.0:</b> Universal CLion compatibility (<b>2024.2 – 2026.3+</b>, Classic &amp; Nova), One-Click <b>Debug TC</b> in CLion Debugger, <b>Sanitizers</b> toggle (ASan/UBSan + MinGW STL debug fallback), side-by-side <b>Colored Visual Diff</b>, and <b>Live Codeforces Verdicts</b> inside CLion.</li>
             <li><b>1.5.3:</b> Fixed cph-submit idle polling (returns HTTP 404 when no submission is queued) to guarantee zero unintended browser tabs.</li>
             <li><b>1.5.2:</b> Full resource &amp; thread-pool hygiene, multi-window CLion support, Stop button for single-test runs, Gson upgrade safety, Codeforces EDU support, and hardened CMake GLOB detection.</li>
             <li><b>1.4.x:</b> Pixel-faithful CPH UI, instant trash delete, isolated CMake auto-sync with reload, and dual-mode smart Codeforces Submit (with cph-submit IPv6/IPv4 support).</li>
@@ -23,7 +45,7 @@
     ]]></change-notes>
 
     <depends>com.intellij.modules.platform</depends>
-    <depends>com.intellij.clion</depends>
+    <depends>com.intellij.modules.clion</depends>
 
     <extensions defaultExtensionNs="com.intellij">
         <toolWindow

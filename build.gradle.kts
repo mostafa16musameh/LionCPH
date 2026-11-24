@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "com.lioncph"
-version = "1.5.3"
+version = "1.9.2"
 
 repositories {
     mavenCentral()
@@ -28,10 +28,14 @@ kotlin {
 }
 
 tasks {
+    withType<JavaCompile>().configureEach {
+        sourceCompatibility = "21"
+        targetCompatibility = "21"
+    }
     withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
         compilerOptions {
             jvmTarget.set(
-                org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_25
+                org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21
             )
         }
     }
@@ -40,7 +44,7 @@ tasks {
 intellijPlatform {
     pluginConfiguration {
         ideaVersion {
-            sinceBuild = "263"
+            sinceBuild = "242"
             untilBuild = provider { null }
         }
     }

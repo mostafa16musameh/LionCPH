@@ -130,21 +130,36 @@ object JudgeService {
 
         val compiler = resolveCompiler(settings.compilerPath)
         val mtime = runCatching { Files.getLastModifiedTime(cppFile).toMillis() }.getOrDefault(-1L)
-        val signature = "$mtime|$compiler|${settings.compilerArgs}|${settings.setOnlineJudge}"
+        val signature = "$mtime|$compiler|${settings.compilerArgs}|${settings.setOnlineJudge}|${settings.enableSanitizers}"
         val cacheKey = cppFile.toAbsolutePath().toString()
         val cached = compileCache[cacheKey]
         if (cached != null && cached.signature == signature && Files.isRegularFile(cached.binaryPath)) {
             return CompileOutcome(true, cached.binaryPath)
         }
 
-        val rawArgs = settings.compilerArgs.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
-        var outcome = runCompile(compiler, rawArgs, settings.setOnlineJudge, cppFile, binaryPath)
+        val baseArgs = settings.compilerArgs.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        val activeArgs = if (settings.enableSanitizers) {
+            baseArgs + listOf("-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g")
+        } else {
+            baseArgs
+        }
+        var outcome = runCompile(compiler, activeArgs, settings.setOnlineJudge, cppFile, binaryPath)
 
-        if (!outcome.success && rawArgs.any { it.equals("-std=c++23", true) } &&
+        // Fallback if MinGW/GCC on Windows lacks libasan/libubsan: use GCC STL bounds checking (-D_GLIBCXX_DEBUG)
+        if (!outcome.success && settings.enableSanitizers &&
+            (outcome.stderr.contains("asan", ignoreCase = true) ||
+                outcome.stderr.contains("ubsan", ignoreCase = true) ||
+                outcome.stderr.contains("sanitize", ignoreCase = true))
+        ) {
+            val debugStlArgs = baseArgs + listOf("-D_GLIBCXX_DEBUG", "-D_GLIBCXX_DEBUG_PEDANTIC", "-g")
+            outcome = runCompile(compiler, debugStlArgs, settings.setOnlineJudge, cppFile, binaryPath)
+        }
+
+        if (!outcome.success && activeArgs.any { it.equals("-std=c++23", true) } &&
             outcome.stderr.contains("c++23", ignoreCase = true)
         ) {
             for (fallbackStd in listOf("-std=c++20", "-std=c++17")) {
-                val patchedArgs = rawArgs.map { if (it.equals("-std=c++23", true)) fallbackStd else it }
+                val patchedArgs = activeArgs.map { if (it.equals("-std=c++23", true)) fallbackStd else it }
                 outcome = runCompile(compiler, patchedArgs, settings.setOnlineJudge, cppFile, binaryPath)
                 if (outcome.success) break
             }
@@ -252,8 +267,11 @@ object JudgeService {
                 }
             }
 
-            // Poll in short slices so Stop/Cancel responds immediately
+            // Poll in short slices so Stop/Cancel responds immediately and peak memory is sampled
             var finished = false
+            var peakMemoryKb = 0L
+            val memLimitKb = (problem.memoryLimit.coerceAtLeast(16)).toLong() * 1024L
+            val pid = runCatching { process.pid() }.getOrDefault(-1L)
             val deadlineNs = startNs + timeLimit * 1_000_000L
             while (System.nanoTime() < deadlineNs) {
                 if (cancelled?.get() == true) {
@@ -263,6 +281,10 @@ object JudgeService {
                     stdoutFuture.cancel(true)
                     stderrFuture.cancel(true)
                     return TestResult(testCase.id, "IDLE")
+                }
+                if (!isWindows && pid > 0) {
+                    val sampleKb = sampleLinuxMemoryKb(pid)
+                    if (sampleKb > peakMemoryKb) peakMemoryKb = sampleKb
                 }
                 if (process.waitFor(40, TimeUnit.MILLISECONDS)) {
                     finished = true
@@ -305,6 +327,19 @@ object JudgeService {
                 )
             }
 
+            if (peakMemoryKb > memLimitKb) {
+                val usedMb = String.format("%.1f", peakMemoryKb / 1024.0)
+                return TestResult(
+                    id = testCase.id,
+                    status = "MLE",
+                    timeMs = elapsedMs,
+                    memoryKb = peakMemoryKb,
+                    stdout = stdout,
+                    stderr = "Memory Limit Exceeded (${usedMb} MB > ${problem.memoryLimit} MB)",
+                    exitCode = 0
+                )
+            }
+
             if (problem.useCustomChecker && problem.customCheckerPath.isNotBlank()) {
                 val (passed, log) = runCustomChecker(problem.customCheckerPath, testCase, stdout, settings)
                 return TestResult(
@@ -318,12 +353,14 @@ object JudgeService {
                 )
             }
 
-            val passed = compareOutputs(testCase.output, stdout, settings.ignoreTrailingSpaces)
-            val diffHint = if (passed) "" else firstDiffHint(testCase.output, stdout, settings.ignoreTrailingSpaces)
+            val effTol = resolveEffectiveFloatTolerance(problem, settings)
+            val passed = compareOutputs(testCase.output, stdout, settings.ignoreTrailingSpaces, effTol)
+            val diffHint = if (passed) "" else firstDiffHint(testCase.output, stdout, settings.ignoreTrailingSpaces, effTol)
             TestResult(
                 id = testCase.id,
                 status = if (passed) "AC" else "WA",
                 timeMs = elapsedMs,
+                memoryKb = peakMemoryKb,
                 stdout = stdout,
                 stderr = stderr,
                 diffHint = diffHint,
@@ -386,18 +423,105 @@ object JudgeService {
         }
     }
 
-    fun compareOutputs(expected: String, received: String, ignoreTrailingSpaces: Boolean): Boolean {
-        return normalize(expected, ignoreTrailingSpaces) == normalize(received, ignoreTrailingSpaces)
+    fun detectToleranceFromTests(tests: List<TestCase>): Double {
+        var maxDecimals = 0
+        val decRegex = Regex("""^-?\d+\.(\d+)$""")
+        for (tc in tests) {
+            val tokens = tc.output.trim().split(Regex("""\s+""")).filter { it.isNotEmpty() }
+            for (tok in tokens) {
+                val m = decRegex.matchEntire(tok) ?: continue
+                val d = m.groupValues[1].length
+                if (d > maxDecimals) maxDecimals = d
+            }
+        }
+        return when {
+            maxDecimals >= 8 -> 1e-9
+            maxDecimals >= 4 -> 1e-6
+            else -> 0.0
+        }
     }
 
-    private fun firstDiffHint(expected: String, received: String, ignoreTrailingSpaces: Boolean): String {
+    fun resolveEffectiveFloatTolerance(problem: ProblemData, settings: CphSettings): Double {
+        return when (settings.floatToleranceMode.lowercase()) {
+            "exact" -> 0.0
+            "custom" -> settings.floatTolerance.coerceAtLeast(0.0)
+            else -> {
+                if (problem.detectedFloatTolerance > 0.0) problem.detectedFloatTolerance
+                else detectToleranceFromTests(problem.tests)
+            }
+        }
+    }
+
+    fun formatTolerance(tol: Double): String {
+        if (tol <= 0.0) return "Exact"
+        return when {
+            kotlin.math.abs(tol - 1e-4) < 1e-12 -> "1e-4"
+            kotlin.math.abs(tol - 1e-5) < 1e-12 -> "1e-5"
+            kotlin.math.abs(tol - 1e-6) < 1e-12 -> "1e-6"
+            kotlin.math.abs(tol - 1e-7) < 1e-12 -> "1e-7"
+            kotlin.math.abs(tol - 1e-9) < 1e-12 -> "1e-9"
+            kotlin.math.abs(tol - 1e-12) < 1e-15 -> "1e-12"
+            else -> "%.1e".format(java.util.Locale.US, tol)
+        }
+    }
+
+    fun compareOutputs(
+        expected: String,
+        received: String,
+        ignoreTrailingSpaces: Boolean,
+        floatTolerance: Double = 0.0
+    ): Boolean {
+        val normExp = normalize(expected, ignoreTrailingSpaces)
+        val normRec = normalize(received, ignoreTrailingSpaces)
+        if (normExp == normRec) return true
+        if (floatTolerance <= 0.0) return false
+
+        val expLines = normExp.lines()
+        val recLines = normRec.lines()
+        if (expLines.size != recLines.size) return false
+        for (i in expLines.indices) {
+            if (!linesMatchWithTolerance(expLines[i], recLines[i], floatTolerance)) return false
+        }
+        return true
+    }
+
+    private fun linesMatchWithTolerance(expLine: String, recLine: String, tol: Double): Boolean {
+        if (expLine == recLine) return true
+        val expTokens = expLine.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        val recTokens = recLine.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (expTokens.size != recTokens.size) return false
+        for (j in expTokens.indices) {
+            val et = expTokens[j]
+            val rt = recTokens[j]
+            if (et == rt) continue
+            val ev = et.toDoubleOrNull()
+            val rv = rt.toDoubleOrNull()
+            if (ev == null || rv == null || !ev.isFinite() || !rv.isFinite()) return false
+            val diff = kotlin.math.abs(ev - rv)
+            val scale = maxOf(1.0, kotlin.math.abs(ev))
+            if (diff > tol * scale) return false
+        }
+        return true
+    }
+
+    private fun firstDiffHint(
+        expected: String,
+        received: String,
+        ignoreTrailingSpaces: Boolean,
+        floatTolerance: Double = 0.0
+    ): String {
         val expLines = normalize(expected, ignoreTrailingSpaces).lines()
         val recLines = normalize(received, ignoreTrailingSpaces).lines()
         val maxLen = maxOf(expLines.size, recLines.size)
         for (i in 0 until maxLen) {
             val e = expLines.getOrNull(i)
             val r = recLines.getOrNull(i)
-            if (e != r) {
+            val matches = if (e != null && r != null && floatTolerance > 0.0) {
+                linesMatchWithTolerance(e, r, floatTolerance)
+            } else {
+                e == r
+            }
+            if (!matches) {
                 val eShow = (e ?: "<EOF>").take(60)
                 val rShow = (r ?: "<EOF>").take(60)
                 return "Diff at line ${i + 1}: expected '$eShow', got '$rShow'"
@@ -461,5 +585,22 @@ object JudgeService {
         } finally {
             tempDir?.toFile()?.deleteRecursively()
         }
+    }
+
+    private fun sampleLinuxMemoryKb(pid: Long): Long {
+        return runCatching {
+            val statusFile = Path.of("/proc/$pid/status")
+            if (!Files.isRegularFile(statusFile)) return 0L
+            var hwm = 0L
+            var rss = 0L
+            for (line in Files.readAllLines(statusFile, StandardCharsets.UTF_8)) {
+                if (line.startsWith("VmHWM:")) {
+                    hwm = Regex("(\\d+)").find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                } else if (line.startsWith("VmRSS:")) {
+                    rss = Regex("(\\d+)").find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                }
+            }
+            maxOf(hwm, rss)
+        }.getOrDefault(0L)
     }
 }

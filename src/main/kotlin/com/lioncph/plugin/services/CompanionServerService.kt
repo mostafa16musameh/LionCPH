@@ -126,15 +126,10 @@ object CompanionServerService {
                 tests.add(TestCase(input = "", output = ""))
             }
 
-            val baseSlug = rawName
-                .replace(Regex("[^a-zA-Z0-9_\\- ]"), "")
-                .trim()
-                .replace(Regex("\\s+"), "_")
-                .ifBlank { "problem_${rawName.hashCode().toUInt()}" }
-
-            val fileName = "$baseSlug.cpp"
-            val cppFile = root.resolve(fileName)
             val settings = CphStorage.loadSettings(root)
+            val dest = FolderOrganizerService.resolveDestination(root, rawName, group, url, settings)
+            val cppFile = dest.directory.resolve(dest.fileName)
+            val relPath = root.relativize(cppFile).toString().replace('\\', '/')
             if (!Files.exists(cppFile)) {
                 val dateStr = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE)
                 val timeStr = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
@@ -146,7 +141,7 @@ object CompanionServerService {
                 Files.writeString(cppFile, code + "\n", StandardCharsets.UTF_8)
             }
 
-            CMakeSyncService.registerPluginFile(root, baseSlug, fileName)
+            CMakeSyncService.registerPluginFile(root, dest.cmakeTargetHint, relPath)
 
             val problem = ProblemData(
                 name = rawName,

@@ -19,7 +19,7 @@ object CMakeSyncService {
     private const val INCLUDE_LINE = "include(\"\${CMAKE_CURRENT_SOURCE_DIR}/.cph/lioncph_targets.cmake\" OPTIONAL)"
     private const val INCLUDE_COMMENT = "# LionCPH auto-managed targets (safe & optional)"
 
-    fun registerPluginFile(projectRoot: Path, rawTarget: String, fileName: String) {
+    fun registerPluginFile(projectRoot: Path, rawTarget: String, relativeFilePath: String) {
         val settings = CphStorage.loadSettings(projectRoot)
         if (!settings.autoSyncCMake) return
 
@@ -31,8 +31,11 @@ object CMakeSyncService {
 
             // If the user already uses file(GLOB ...) for *.cpp in the root, do not duplicate targets;
             // just touch CMakeLists.txt so CLion reloads the new file.
-            val hasRootGlob = Regex("""file\s*\(\s*GLOB(?:_RECURSE)?\s+\w+(?:\s+CONFIGURE_DEPENDS)?\s+"?(?:\$\{CMAKE_(?:CURRENT_)?SOURCE_DIR\}/)?\*\.cpp"?""", RegexOption.IGNORE_CASE).containsMatchIn(mainContent)
-            if (hasRootGlob) {
+            val normRel = relativeFilePath.replace('\\', '/')
+            val isInSubdir = normRel.contains('/')
+            val hasRootGlob = Regex("""file\s*\(\s*GLOB\s+\w+(?:\s+CONFIGURE_DEPENDS)?\s+"?(?:\$\{CMAKE_(?:CURRENT_)?SOURCE_DIR\}/)?\*\.cpp"?""", RegexOption.IGNORE_CASE).containsMatchIn(mainContent)
+            val hasRecurseGlob = Regex("""file\s*\(\s*GLOB_RECURSE\s+\w+(?:\s+CONFIGURE_DEPENDS)?\s+"?(?:\$\{CMAKE_(?:CURRENT_)?SOURCE_DIR\}/)?\*\.cpp"?""", RegexOption.IGNORE_CASE).containsMatchIn(mainContent)
+            if (hasRecurseGlob || (!isInSubdir && hasRootGlob)) {
                 Files.setLastModifiedTime(cmakeFile, FileTime.fromMillis(System.currentTimeMillis()))
                 return
             }
@@ -55,7 +58,7 @@ object CMakeSyncService {
             }
 
             // Skip if already registered in either CMakeLists.txt or lioncph_targets.cmake
-            if (mainContent.contains(fileName) || existing.contains(fileName)) {
+            if (mainContent.contains(normRel) || existing.contains(normRel)) {
                 syncOnlineJudgeMacro(projectRoot, settings.setOnlineJudge, null)
                 return
             }
@@ -76,8 +79,8 @@ object CMakeSyncService {
             val sep = if (existing.endsWith("\n") || existing.isEmpty()) "" else "\n"
             val block = buildString {
                 append(sep)
-                append("if(EXISTS \"\${CMAKE_CURRENT_SOURCE_DIR}/$fileName\" AND NOT TARGET $uniqueTarget)\n")
-                append("    add_executable($uniqueTarget \"\${CMAKE_CURRENT_SOURCE_DIR}/$fileName\")\n")
+                append("if(EXISTS \"\${CMAKE_CURRENT_SOURCE_DIR}/$normRel\" AND NOT TARGET $uniqueTarget)\n")
+                append("    add_executable($uniqueTarget \"\${CMAKE_CURRENT_SOURCE_DIR}/$normRel\")\n")
                 append("    target_compile_definitions($uniqueTarget PRIVATE $macroDef)\n")
                 append("endif()\n")
             }
@@ -113,8 +116,8 @@ object CMakeSyncService {
      */
     fun triggerCMakeReload(projectRoot: Path, project: Project? = null) {
         ApplicationManager.getApplication().invokeLater {
-            LocalFileSystem.getInstance().refreshAndFindFileByNioFile(projectRoot.resolve("CMakeLists.txt"))?.refresh(false, false)
-            LocalFileSystem.getInstance().refreshAndFindFileByNioFile(projectRoot.resolve(".cph/lioncph_targets.cmake"))?.refresh(false, false)
+            LocalFileSystem.getInstance().refreshAndFindFileByNioFile(projectRoot.resolve("CMakeLists.txt"))?.refresh(true, false)
+            LocalFileSystem.getInstance().refreshAndFindFileByNioFile(projectRoot.resolve(".cph/lioncph_targets.cmake"))?.refresh(true, false)
             runCatching {
                 val am = ActionManager.getInstance()
                 val reloadAction = am.getAction("CMake.ReloadCMakeProject")
