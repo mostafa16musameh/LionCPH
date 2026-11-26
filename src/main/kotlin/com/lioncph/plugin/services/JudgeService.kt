@@ -11,8 +11,11 @@ import java.io.InputStream
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import java.security.MessageDigest
+import java.util.Locale
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -24,16 +27,36 @@ data class CompileOutcome(
 
 object JudgeService {
     private val isWindows = System.getProperty("os.name").lowercase().contains("win")
+    private val isMac = System.getProperty("os.name").lowercase().contains("mac")
     private const val MAX_OUTPUT_BYTES = 512 * 1024
+    private val ioExecutor = Executors.newCachedThreadPool { r ->
+        Thread(r, "LionCPH-Judge-IO").apply { isDaemon = true }
+    }
 
     @Volatile
     private var cachedCompilerBinDir: String? = null
 
     private data class CompileCacheEntry(val signature: String, val binaryPath: Path)
     private val compileCache = ConcurrentHashMap<String, CompileCacheEntry>()
+    private val compileLocks = ConcurrentHashMap<String, Any>()
 
     fun clearCompileCache() {
         compileCache.clear()
+    }
+
+    private fun sha256File(path: Path): String? {
+        return runCatching {
+            val md = MessageDigest.getInstance("SHA-256")
+            Files.newInputStream(path).use { input ->
+                val buf = ByteArray(16384)
+                while (true) {
+                    val read = input.read(buf)
+                    if (read == -1) break
+                    md.update(buf, 0, read)
+                }
+            }
+            md.digest().joinToString("") { "%02x".format(it) }
+        }.getOrNull()
     }
 
     fun resolveCompiler(configured: String): String {
@@ -119,59 +142,106 @@ object JudgeService {
         }
     }
 
-    fun compile(projectRoot: Path, cppFile: Path, settings: CphSettings): CompileOutcome {
-        val buildDir = projectRoot.resolve(".cph").resolve("bin")
-        Files.createDirectories(buildDir)
-
-        val baseName = cppFile.fileName.toString().substringBeforeLast('.')
-        val pathHash = (cppFile.toAbsolutePath().normalize().toString().hashCode().toUInt()).toString(16)
-        val exeName = if (isWindows) "${baseName}_$pathHash.exe" else "${baseName}_$pathHash"
-        val binaryPath = buildDir.resolve(exeName)
-
-        val compiler = resolveCompiler(settings.compilerPath)
-        val mtime = runCatching { Files.getLastModifiedTime(cppFile).toMillis() }.getOrDefault(-1L)
-        val signature = "$mtime|$compiler|${settings.compilerArgs}|${settings.setOnlineJudge}|${settings.enableSanitizers}"
-        val cacheKey = cppFile.toAbsolutePath().toString()
-        val cached = compileCache[cacheKey]
-        if (cached != null && cached.signature == signature && Files.isRegularFile(cached.binaryPath)) {
-            return CompileOutcome(true, cached.binaryPath)
+    fun compile(
+        projectRoot: Path,
+        cppFile: Path,
+        settings: CphSettings,
+        cancelled: AtomicBoolean? = null,
+        activeProcesses: MutableSet<Process>? = null
+    ): CompileOutcome {
+        if (cancelled?.get() == true) {
+            return CompileOutcome(false, null, "Compilation cancelled.")
         }
+        val normalizedCpp = cppFile.toAbsolutePath().normalize()
+        val cacheKey = normalizedCpp.toString()
+        val fileLock = compileLocks.computeIfAbsent(cacheKey) { Any() }
 
-        val baseArgs = settings.compilerArgs.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
-        val activeArgs = if (settings.enableSanitizers) {
-            baseArgs + listOf("-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g")
-        } else {
-            baseArgs
-        }
-        var outcome = runCompile(compiler, activeArgs, settings.setOnlineJudge, cppFile, binaryPath)
-
-        // Fallback if MinGW/GCC on Windows lacks libasan/libubsan: use GCC STL bounds checking (-D_GLIBCXX_DEBUG)
-        if (!outcome.success && settings.enableSanitizers &&
-            (outcome.stderr.contains("asan", ignoreCase = true) ||
-                outcome.stderr.contains("ubsan", ignoreCase = true) ||
-                outcome.stderr.contains("sanitize", ignoreCase = true))
-        ) {
-            val debugStlArgs = baseArgs + listOf("-D_GLIBCXX_DEBUG", "-D_GLIBCXX_DEBUG_PEDANTIC", "-g")
-            outcome = runCompile(compiler, debugStlArgs, settings.setOnlineJudge, cppFile, binaryPath)
-        }
-
-        if (!outcome.success && activeArgs.any { it.equals("-std=c++23", true) } &&
-            outcome.stderr.contains("c++23", ignoreCase = true)
-        ) {
-            for (fallbackStd in listOf("-std=c++20", "-std=c++17")) {
-                val patchedArgs = activeArgs.map { if (it.equals("-std=c++23", true)) fallbackStd else it }
-                outcome = runCompile(compiler, patchedArgs, settings.setOnlineJudge, cppFile, binaryPath)
-                if (outcome.success) break
+        return synchronized(fileLock) {
+            if (cancelled?.get() == true) {
+                return@synchronized CompileOutcome(false, null, "Compilation cancelled.")
             }
-        }
+            val contentHash = sha256File(normalizedCpp)
+                ?: return@synchronized CompileOutcome(false, null, "Failed to read source file: $normalizedCpp")
 
-        if (outcome.success && outcome.binaryPath != null) {
-            compileCache[cacheKey] = CompileCacheEntry(signature, outcome.binaryPath)
-        } else {
-            compileCache.remove(cacheKey)
-        }
+            val buildDir = projectRoot.resolve(".cph").resolve("bin")
+            Files.createDirectories(buildDir)
 
-        return outcome
+            val baseName = normalizedCpp.fileName.toString().substringBeforeLast('.')
+            val pathHash = (cacheKey.hashCode().toUInt()).toString(16)
+            val exeName = if (isWindows) "${baseName}_$pathHash.exe" else "${baseName}_$pathHash"
+            val binaryPath = buildDir.resolve(exeName)
+
+            val compiler = resolveCompiler(settings.compilerPath)
+            val baseArgs = tokenizeArgs(settings.compilerArgs)
+            val parentDir = normalizedCpp.parent?.toString().orEmpty()
+            val signature = "$contentHash|$compiler|${baseArgs.joinToString("\u0000")}|${settings.setOnlineJudge}|${settings.enableSanitizers}|$parentDir"
+            val cached = compileCache[cacheKey]
+            if (cached != null && cached.signature == signature && Files.isRegularFile(cached.binaryPath)) {
+                return@synchronized CompileOutcome(true, cached.binaryPath)
+            }
+
+            var activeArgs = if (settings.enableSanitizers) {
+                baseArgs + listOf("-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g")
+            } else {
+                baseArgs
+            }
+            var outcome = runCompile(compiler, activeArgs, settings.setOnlineJudge, normalizedCpp, binaryPath, cancelled, activeProcesses)
+
+            // Fallback if MinGW/GCC on Windows lacks libasan/libubsan: use GCC STL bounds checking (-D_GLIBCXX_DEBUG)
+            if (!outcome.success && cancelled?.get() != true && settings.enableSanitizers &&
+                (outcome.stderr.contains("asan", ignoreCase = true) ||
+                    outcome.stderr.contains("ubsan", ignoreCase = true) ||
+                    outcome.stderr.contains("sanitize", ignoreCase = true))
+            ) {
+                activeArgs = baseArgs + listOf("-D_GLIBCXX_DEBUG", "-D_GLIBCXX_DEBUG_PEDANTIC", "-g")
+                outcome = runCompile(compiler, activeArgs, settings.setOnlineJudge, normalizedCpp, binaryPath, cancelled, activeProcesses)
+            }
+
+            if (!outcome.success && cancelled?.get() != true && activeArgs.any { it.equals("-std=c++23", true) } &&
+                outcome.stderr.contains("c++23", ignoreCase = true)
+            ) {
+                for (fallbackStd in listOf("-std=c++20", "-std=c++17")) {
+                    if (cancelled?.get() == true) break
+                    val patchedArgs = activeArgs.map { if (it.equals("-std=c++23", true)) fallbackStd else it }
+                    outcome = runCompile(compiler, patchedArgs, settings.setOnlineJudge, normalizedCpp, binaryPath, cancelled, activeProcesses)
+                    if (outcome.success) break
+                }
+            }
+
+            if (outcome.success && outcome.binaryPath != null && cancelled?.get() != true) {
+                compileCache[cacheKey] = CompileCacheEntry(signature, outcome.binaryPath)
+            } else {
+                compileCache.remove(cacheKey)
+            }
+
+            outcome
+        }
+    }
+
+    private fun tokenizeArgs(raw: String): List<String> {
+        val out = mutableListOf<String>()
+        val cur = StringBuilder()
+        var quote: Char? = null
+        var i = 0
+        while (i < raw.length) {
+            val ch = raw[i]
+            when {
+                quote != null -> {
+                    if (ch == quote) quote = null else cur.append(ch)
+                }
+                ch == '"' || ch == '\'' -> quote = ch
+                ch.isWhitespace() -> {
+                    if (cur.isNotEmpty()) {
+                        out.add(cur.toString())
+                        cur.setLength(0)
+                    }
+                }
+                else -> cur.append(ch)
+            }
+            i++
+        }
+        if (cur.isNotEmpty()) out.add(cur.toString())
+        return out
     }
 
     private fun runCompile(
@@ -179,8 +249,13 @@ object JudgeService {
         args: List<String>,
         setOnlineJudge: Boolean,
         cppFile: Path,
-        binaryPath: Path
+        binaryPath: Path,
+        cancelled: AtomicBoolean? = null,
+        activeProcesses: MutableSet<Process>? = null
     ): CompileOutcome {
+        if (cancelled?.get() == true) {
+            return CompileOutcome(false, null, "Compilation cancelled.")
+        }
         val cmd = mutableListOf<String>()
         cmd.add(compiler)
         cmd.addAll(args)
@@ -193,40 +268,61 @@ object JudgeService {
         cmd.add("-o")
         cmd.add(binaryPath.toAbsolutePath().toString())
 
+        var process: Process? = null
         return try {
             val pb = ProcessBuilder(cmd)
                 .directory(cppFile.parent.toFile())
                 .redirectErrorStream(false)
             applyCompilerPathEnv(pb)
-            val process = pb.start()
+            process = pb.start()
+            activeProcesses?.add(process)
 
-            val stdoutFuture = CompletableFuture.supplyAsync {
-                readCapped(process.inputStream, MAX_OUTPUT_BYTES)
+            val p = process
+            val stdoutFuture = CompletableFuture.supplyAsync({
+                readCapped(p.inputStream, MAX_OUTPUT_BYTES)
+            }, ioExecutor)
+            val stderrFuture = CompletableFuture.supplyAsync({
+                readCapped(p.errorStream, MAX_OUTPUT_BYTES)
+            }, ioExecutor)
+
+            val deadlineNs = System.nanoTime() + 30_000_000_000L
+            var finished = false
+            while (System.nanoTime() < deadlineNs) {
+                if (cancelled?.get() == true) {
+                    p.descendants().forEach { it.destroyForcibly() }
+                    p.destroyForcibly()
+                    runCatching { p.waitFor(200, TimeUnit.MILLISECONDS) }
+                    stdoutFuture.cancel(true)
+                    stderrFuture.cancel(true)
+                    return CompileOutcome(false, null, "Compilation cancelled.")
+                }
+                if (p.waitFor(50, TimeUnit.MILLISECONDS)) {
+                    finished = true
+                    break
+                }
             }
-            val stderrFuture = CompletableFuture.supplyAsync {
-                readCapped(process.errorStream, MAX_OUTPUT_BYTES)
-            }
-            val finished = process.waitFor(30, TimeUnit.SECONDS)
 
             if (!finished) {
-                process.descendants().forEach { it.destroyForcibly() }
-                process.destroyForcibly()
-                process.waitFor()
+                p.descendants().forEach { it.destroyForcibly() }
+                p.destroyForcibly()
+                runCatching { p.waitFor(300, TimeUnit.MILLISECONDS) }
                 stdoutFuture.cancel(true)
                 stderrFuture.cancel(true)
                 CompileOutcome(false, null, "Compilation timed out after 30s.")
             } else {
-                val stdout = stdoutFuture.get(2, TimeUnit.SECONDS)
-                val stderr = stderrFuture.get(2, TimeUnit.SECONDS)
-                if (process.exitValue() != 0) {
+                val stdout = runCatching { stdoutFuture.get(2, TimeUnit.SECONDS) }.getOrDefault("")
+                val stderr = runCatching { stderrFuture.get(2, TimeUnit.SECONDS) }.getOrDefault("")
+                if (p.exitValue() != 0) {
                     val combined = listOf(stderr, stdout).filter { it.isNotBlank() }.joinToString("\n")
-                    CompileOutcome(false, null, combined.ifBlank { "Compilation failed with exit code ${process.exitValue()}" })
+                    CompileOutcome(false, null, combined.ifBlank { "Compilation failed with exit code ${p.exitValue()}" })
                 } else {
                     CompileOutcome(true, binaryPath, stderr)
                 }
             }
         } catch (e: Exception) {
             CompileOutcome(false, null, "Failed to run compiler '$compiler': ${e.message}")
+        } finally {
+            if (process != null) activeProcesses?.remove(process)
         }
     }
 
@@ -252,27 +348,29 @@ object JudgeService {
             process = pb.start()
             activeProcesses?.add(process)
 
-            val stdoutFuture = CompletableFuture.supplyAsync {
+            val stdoutFuture = CompletableFuture.supplyAsync({
                 readCapped(process.inputStream, MAX_OUTPUT_BYTES)
-            }
-            val stderrFuture = CompletableFuture.supplyAsync {
+            }, ioExecutor)
+            val stderrFuture = CompletableFuture.supplyAsync({
                 readCapped(process.errorStream, MAX_OUTPUT_BYTES)
-            }
-            val stdinFuture = CompletableFuture.runAsync {
+            }, ioExecutor)
+            val stdinFuture = CompletableFuture.runAsync({
                 runCatching {
                     process.outputStream.use { out ->
                         out.write(testCase.input.toByteArray(StandardCharsets.UTF_8))
                         out.flush()
                     }
                 }
-            }
+            }, ioExecutor)
 
             // Poll in short slices so Stop/Cancel responds immediately and peak memory is sampled
             var finished = false
             var peakMemoryKb = 0L
             val memLimitKb = (problem.memoryLimit.coerceAtLeast(16)).toLong() * 1024L
             val pid = runCatching { process.pid() }.getOrDefault(-1L)
-            val deadlineNs = startNs + timeLimit * 1_000_000L
+            var deadlineNs = startNs + timeLimit * 1_000_000L
+            var lastExternalMemSampleNs = startNs
+            var externalSampleOverheadNs = 0L
             while (System.nanoTime() < deadlineNs) {
                 if (cancelled?.get() == true) {
                     process.descendants().forEach { it.destroyForcibly() }
@@ -282,7 +380,7 @@ object JudgeService {
                     stderrFuture.cancel(true)
                     return TestResult(testCase.id, "IDLE")
                 }
-                if (!isWindows && pid > 0) {
+                if (!isWindows && !isMac && pid > 0) {
                     val sampleKb = sampleLinuxMemoryKb(pid)
                     if (sampleKb > peakMemoryKb) peakMemoryKb = sampleKb
                 }
@@ -290,9 +388,21 @@ object JudgeService {
                     finished = true
                     break
                 }
+                if ((isWindows || isMac) && pid > 0) {
+                    val nowNs = System.nanoTime()
+                    if (nowNs - lastExternalMemSampleNs >= 120_000_000L) {
+                        val sampleStartNs = System.nanoTime()
+                        val sampleKb = if (isMac) sampleMacMemoryKb(pid) else sampleWindowsMemoryKb(pid)
+                        val sampleCostNs = (System.nanoTime() - sampleStartNs).coerceAtLeast(0L)
+                        externalSampleOverheadNs += sampleCostNs
+                        deadlineNs += sampleCostNs
+                        lastExternalMemSampleNs = System.nanoTime()
+                        if (sampleKb > peakMemoryKb) peakMemoryKb = sampleKb
+                    }
+                }
             }
 
-            val elapsedMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(0L)
+            val elapsedMs = ((System.nanoTime() - startNs - externalSampleOverheadNs) / 1_000_000L).coerceAtLeast(0L)
 
             if (!finished) {
                 process.descendants().forEach { it.destroyForcibly() }
@@ -314,21 +424,8 @@ object JudgeService {
             val stderr = runCatching { stderrFuture.get(1, TimeUnit.SECONDS) }.getOrDefault("")
             val exitCode = process.exitValue()
 
-            if (exitCode != 0) {
-                val signalHint = describeExitCode(exitCode)
-                val errMsg = if (stderr.isNotBlank()) "$signalHint\n$stderr" else signalHint
-                return TestResult(
-                    id = testCase.id,
-                    status = "RE",
-                    timeMs = elapsedMs,
-                    stdout = stdout,
-                    stderr = errMsg,
-                    exitCode = exitCode
-                )
-            }
-
             if (peakMemoryKb > memLimitKb) {
-                val usedMb = String.format("%.1f", peakMemoryKb / 1024.0)
+                val usedMb = String.format(Locale.US, "%.1f", peakMemoryKb / 1024.0)
                 return TestResult(
                     id = testCase.id,
                     status = "MLE",
@@ -336,16 +433,34 @@ object JudgeService {
                     memoryKb = peakMemoryKb,
                     stdout = stdout,
                     stderr = "Memory Limit Exceeded (${usedMb} MB > ${problem.memoryLimit} MB)",
-                    exitCode = 0
+                    exitCode = exitCode
+                )
+            }
+
+            if (exitCode != 0) {
+                val signalHint = describeExitCode(exitCode)
+                val errMsg = if (stderr.isNotBlank()) "$signalHint\n$stderr" else signalHint
+                return TestResult(
+                    id = testCase.id,
+                    status = "RE",
+                    timeMs = elapsedMs,
+                    memoryKb = peakMemoryKb,
+                    stdout = stdout,
+                    stderr = errMsg,
+                    exitCode = exitCode
                 )
             }
 
             if (problem.useCustomChecker && problem.customCheckerPath.isNotBlank()) {
-                val (passed, log) = runCustomChecker(problem.customCheckerPath, testCase, stdout, settings)
+                val (passed, log) = runCustomChecker(problem.customCheckerPath, testCase, stdout, settings, cancelled, activeProcesses)
+                if (cancelled?.get() == true) {
+                    return TestResult(testCase.id, "IDLE")
+                }
                 return TestResult(
                     id = testCase.id,
                     status = if (passed) "AC" else "WA",
                     timeMs = elapsedMs,
+                    memoryKb = peakMemoryKb,
                     stdout = stdout,
                     stderr = stderr,
                     checkerLog = log,
@@ -426,12 +541,21 @@ object JudgeService {
     fun detectToleranceFromTests(tests: List<TestCase>): Double {
         var maxDecimals = 0
         val decRegex = Regex("""^-?\d+\.(\d+)$""")
+        val sciRegex = Regex("""^-?\d+(?:\.(\d+))?[eE]([+-]?\d+)$""")
         for (tc in tests) {
             val tokens = tc.output.trim().split(Regex("""\s+""")).filter { it.isNotEmpty() }
             for (tok in tokens) {
-                val m = decRegex.matchEntire(tok) ?: continue
-                val d = m.groupValues[1].length
-                if (d > maxDecimals) maxDecimals = d
+                decRegex.matchEntire(tok)?.let { m ->
+                    val d = m.groupValues[1].length
+                    if (d > maxDecimals) maxDecimals = d
+                    return@let
+                }
+                sciRegex.matchEntire(tok)?.let { m ->
+                    val frac = m.groupValues[1].length
+                    val exp = m.groupValues[2].toIntOrNull() ?: 0
+                    val effective = (if (exp < 0) -exp else 0) + frac
+                    if (effective > maxDecimals) maxDecimals = effective
+                }
             }
         }
         return when {
@@ -546,9 +670,15 @@ object JudgeService {
         checkerPath: String,
         testCase: TestCase,
         received: String,
-        settings: CphSettings
+        settings: CphSettings,
+        cancelled: AtomicBoolean? = null,
+        activeProcesses: MutableSet<Process>? = null
     ): Pair<Boolean, String> {
+        if (cancelled?.get() == true) {
+            return false to "Checker cancelled."
+        }
         var tempDir: Path? = null
+        var process: Process? = null
         return try {
             val checkerTempDir = Files.createTempDirectory("lioncph_checker_")
             tempDir = checkerTempDir
@@ -559,30 +689,49 @@ object JudgeService {
             Files.writeString(expFile, testCase.output, StandardCharsets.UTF_8)
             Files.writeString(outFile, received, StandardCharsets.UTF_8)
 
-            val process = ProcessBuilder(
+            val started = ProcessBuilder(
                 settings.pythonPath.ifBlank { "python3" },
                 checkerPath,
                 inFile.toString(),
                 expFile.toString(),
                 outFile.toString()
             ).redirectErrorStream(true).start()
+            process = started
+            activeProcesses?.add(started)
 
-            val logFuture = CompletableFuture.supplyAsync {
-                readCapped(process.inputStream, MAX_OUTPUT_BYTES)
+            val logFuture = CompletableFuture.supplyAsync({
+                readCapped(started.inputStream, MAX_OUTPUT_BYTES)
+            }, ioExecutor)
+
+            val deadlineNs = System.nanoTime() + 10_000_000_000L
+            var finished = false
+            while (System.nanoTime() < deadlineNs) {
+                if (cancelled?.get() == true) {
+                    started.descendants().forEach { it.destroyForcibly() }
+                    started.destroyForcibly()
+                    runCatching { started.waitFor(200, TimeUnit.MILLISECONDS) }
+                    logFuture.cancel(true)
+                    return false to "Checker cancelled."
+                }
+                if (started.waitFor(40, TimeUnit.MILLISECONDS)) {
+                    finished = true
+                    break
+                }
             }
-            val finished = process.waitFor(10, TimeUnit.SECONDS)
             if (!finished) {
-                process.destroyForcibly()
-                process.waitFor()
+                started.descendants().forEach { it.destroyForcibly() }
+                started.destroyForcibly()
+                runCatching { started.waitFor(300, TimeUnit.MILLISECONDS) }
                 logFuture.cancel(true)
                 return false to "Checker timed out after 10s."
             }
-            val log = logFuture.get(2, TimeUnit.SECONDS)
-            val ok = process.exitValue() == 0
+            val log = runCatching { logFuture.get(2, TimeUnit.SECONDS) }.getOrDefault("")
+            val ok = started.exitValue() == 0
             ok to log
         } catch (e: Exception) {
             false to "Checker error: ${e.message}"
         } finally {
+            if (process != null) activeProcesses?.remove(process)
             tempDir?.toFile()?.deleteRecursively()
         }
     }
@@ -601,6 +750,37 @@ object JudgeService {
                 }
             }
             maxOf(hwm, rss)
+        }.getOrDefault(0L)
+    }
+
+    private fun sampleMacMemoryKb(pid: Long): Long {
+        return runCatching {
+            val p = ProcessBuilder("ps", "-o", "rss=", "-p", pid.toString())
+                .redirectErrorStream(true)
+                .start()
+            if (!p.waitFor(200, TimeUnit.MILLISECONDS)) {
+                p.destroyForcibly()
+                return 0L
+            }
+            p.inputStream.bufferedReader(StandardCharsets.UTF_8).readText().trim().toLongOrNull() ?: 0L
+        }.getOrDefault(0L)
+    }
+
+    private fun sampleWindowsMemoryKb(pid: Long): Long {
+        return runCatching {
+            val p = ProcessBuilder("tasklist", "/FI", "PID eq $pid", "/FO", "CSV", "/NH")
+                .redirectErrorStream(true)
+                .start()
+            if (!p.waitFor(300, TimeUnit.MILLISECONDS)) {
+                p.destroyForcibly()
+                return 0L
+            }
+            val line = p.inputStream.bufferedReader(StandardCharsets.UTF_8).readText().trim()
+            if (line.isBlank() || !line.startsWith("\"")) return 0L
+            // CSV columns: "Image Name","PID","Session Name","Session#","Mem Usage" (e.g. "12,340 K")
+            val lastCol = line.substringAfterLast("\",\"").trimEnd('"')
+            val digits = lastCol.filter { it.isDigit() }
+            digits.toLongOrNull() ?: 0L
         }.getOrDefault(0L)
     }
 }

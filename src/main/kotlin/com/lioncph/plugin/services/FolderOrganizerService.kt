@@ -179,8 +179,10 @@ object FolderOrganizerService {
             return OrganizedDestination(projectRoot, fileName, baseSlug)
         }
 
-        val relativeFolder = resolveRelativeFolder(projectRoot, group, url, mode)
-        val targetDir = if (relativeFolder.isBlank()) projectRoot else projectRoot.resolve(relativeFolder)
+        val relativeFolder = resolveRelativeFolder(projectRoot, group, url, mode).trim('/')
+        val normalizedRoot = projectRoot.toAbsolutePath().normalize()
+        val candidateDir = if (relativeFolder.isBlank()) normalizedRoot else normalizedRoot.resolve(relativeFolder).normalize()
+        val targetDir = if (candidateDir.startsWith(normalizedRoot)) candidateDir else normalizedRoot
         Files.createDirectories(targetDir)
 
         val folderTag = targetDir.fileName?.toString().orEmpty()
@@ -250,9 +252,9 @@ object FolderOrganizerService {
         // 2. Codeforces EDU
         if (lowerUrl.contains("codeforces.com/edu/")) {
             val cleaned = parts.filterNot { it.equals("Codeforces", true) || it.startsWith("ITMO Academy", true) }
-            val leaf = sanitizeSegment(cleaned.lastOrNull() ?: "EDU_Practice", 36)
+            val leaf = sanitizeSegment(cleaned.lastOrNull() ?: "EDU_Practice", 36).ifBlank { "EDU_Practice" }
             return if (mode == "hierarchy") {
-                val topic = sanitizeSegment(cleaned.firstOrNull() ?: "Course", 32)
+                val topic = sanitizeSegment(cleaned.firstOrNull() ?: "Course", 32).ifBlank { "Course" }
                 if (topic != leaf) "EDU/$topic/$leaf" else "EDU/$leaf"
             } else {
                 "EDU_$leaf"
@@ -283,26 +285,26 @@ object FolderOrganizerService {
         // 4. Codeforces Gym
         if (lowerUrl.contains("codeforces.com/gym/")) {
             val gymRaw = stripCodeforcesPrefix(group)
-            val gymName = sanitizeSegment(gymRaw.ifBlank { extractContestLabel(url) }, 44)
+            val gymName = sanitizeSegment(gymRaw, 44).ifBlank { extractContestLabel(url) }
             return if (mode == "hierarchy") "Gym/$gymName" else gymName
         }
 
         // 5. Codeforces Contest
         if (lowerUrl.contains("codeforces.com/contest/")) {
             val contestRaw = stripCodeforcesPrefix(group)
-            val contestName = sanitizeSegment(contestRaw.ifBlank { extractContestLabel(url) }, 46)
+            val contestName = sanitizeSegment(contestRaw, 46).ifBlank { extractContestLabel(url) }
             return if (mode == "hierarchy") "Contests/$contestName" else contestName
         }
 
         // 6. Other Judges (AtCoder, CSES, VJudge, LeetCode, etc.)
         if (parts.size >= 2) {
-            val platform = sanitizeSegment(parts.first(), 24)
-            val contest = sanitizeSegment(parts.drop(1).joinToString("_"), 40)
+            val platform = sanitizeSegment(parts.first(), 24).ifBlank { "Judge" }
+            val contest = sanitizeSegment(parts.drop(1).joinToString("_"), 40).ifBlank { "Contest" }
             return if (mode == "hierarchy") "$platform/$contest" else contest
         }
 
         if (group.isNotBlank() && !group.equals("local", true) && !group.equals("Competitive Companion", true)) {
-            val name = sanitizeSegment(group, 40)
+            val name = sanitizeSegment(group, 40).ifBlank { "Contest" }
             return if (mode == "hierarchy") "Contests/$name" else name
         }
 
@@ -318,14 +320,21 @@ object FolderOrganizerService {
         return if (cid != null) "Contest_$cid" else "Contest"
     }
 
+    private val WINDOWS_RESERVED = setOf(
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+    )
+
     fun sanitizeSegment(raw: String, maxLen: Int = 42): String {
-        return raw
+        val cleaned = raw
             .replace(Regex("[^a-zA-Z0-9_\\- ]"), "")
             .trim()
             .replace(Regex("\\s+"), "_")
             .replace(Regex("_+"), "_")
             .take(maxLen)
-            .trim('_', '-')
+            .trim('_', '-', '.')
+        return if (cleaned.uppercase() in WINDOWS_RESERVED) "p_$cleaned" else cleaned
     }
 
     /**
@@ -334,9 +343,14 @@ object FolderOrganizerService {
      * canonical destinations, then prunes any empty leftover directories.
      * Never touches non-CPH files (such as main.cpp or user scripts).
      */
-    fun organizeExistingRootFiles(projectRoot: Path, settings: CphSettings): Int {
-        if (effectiveMode(settings) == "flat") return 0
-        var movedCount = 0
+    @Synchronized
+    fun organizeExistingRootFiles(projectRoot: Path, settings: CphSettings): Int =
+        organizeExistingRootFilesWithMap(projectRoot, settings).size
+
+    @Synchronized
+    fun organizeExistingRootFilesWithMap(projectRoot: Path, settings: CphSettings): Map<Path, Path> {
+        if (effectiveMode(settings) == "flat") return emptyMap()
+        val movedMap = LinkedHashMap<Path, Path>()
 
         val candidates = mutableListOf<Path>()
         // 1. Direct files in project root
@@ -375,17 +389,37 @@ object FolderOrganizerService {
                 if (Files.exists(targetFile)) return@runCatching
 
                 val oldProbFile = CphStorage.problemFileFor(projectRoot, cppFile)
+                val newProbFile = CphStorage.problemFileFor(projectRoot, targetFile)
+                val originalSrcPath = problem.srcPath
                 try {
                     Files.move(cppFile, targetFile, StandardCopyOption.ATOMIC_MOVE)
                 } catch (_: Exception) {
                     Files.move(cppFile, targetFile)
                 }
-                runCatching { Files.deleteIfExists(oldProbFile) }
-                CphStorage.saveProblem(projectRoot, targetFile, problem)
+                // Write the new .prob atomically BEFORE deleting oldProbFile; rollback move if .prob persistence fails
+                val savedNewProb = runCatching {
+                    CphStorage.saveProblem(projectRoot, targetFile, problem)
+                    Files.isRegularFile(newProbFile)
+                }.getOrDefault(false)
+                if (!savedNewProb) {
+                    problem.srcPath = originalSrcPath
+                    runCatching { Files.deleteIfExists(newProbFile) }
+                    runCatching {
+                        try {
+                            Files.move(targetFile, cppFile, StandardCopyOption.ATOMIC_MOVE)
+                        } catch (_: Exception) {
+                            Files.move(targetFile, cppFile)
+                        }
+                    }
+                    return@runCatching
+                }
+                if (oldProbFile != newProbFile) {
+                    runCatching { Files.deleteIfExists(oldProbFile) }
+                }
 
                 val relPath = projectRoot.relativize(targetFile).toString().replace('\\', '/')
                 CMakeSyncService.registerPluginFile(projectRoot, dest.cmakeTargetHint, relPath)
-                movedCount++
+                movedMap[cppFile.toAbsolutePath().normalize()] = targetFile.toAbsolutePath().normalize()
             }
         }
 
@@ -396,8 +430,11 @@ object FolderOrganizerService {
                 pruneEmptyDirs(dir)
             }
         }
+        if (movedMap.isNotEmpty()) {
+            CMakeSyncService.pruneMissingTargets(projectRoot)
+        }
 
-        return movedCount
+        return movedMap
     }
 
     private fun pruneEmptyDirs(root: Path) {

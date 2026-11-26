@@ -133,7 +133,7 @@ object CodeforcesSubmitService {
                     problemBaseUrl = "https://codeforces.com/problemset/problem/$contestId/",
                     directSubmitUrl = "https://codeforces.com/problemset/submit?submittedProblemCode=$contestId$index",
                     mySubmissionsUrl = "https://codeforces.com/problemset/status?my=on",
-                    standingsUrl = "https://codeforces.com/problemset"
+                    standingsUrl = "https://codeforces.com/contest/$contestId/standings"
                 )
             }
 
@@ -144,7 +144,7 @@ object CodeforcesSubmitService {
             problemBaseUrl = "",
             directSubmitUrl = trimmed,
             mySubmissionsUrl = "https://codeforces.com/problemset/status?my=on",
-                    standingsUrl = "https://codeforces.com/problemset"
+            standingsUrl = "https://codeforces.com/problemset"
         )
     }
 }

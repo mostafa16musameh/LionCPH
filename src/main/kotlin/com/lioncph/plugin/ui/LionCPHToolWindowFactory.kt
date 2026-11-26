@@ -18,6 +18,7 @@ import com.intellij.openapi.fileEditor.FileEditorManagerListener
 import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.util.IconLoader
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
@@ -89,6 +90,7 @@ import javax.swing.JOptionPane
 import javax.swing.JPanel
 import javax.swing.JScrollPane
 import javax.swing.JTextArea
+import javax.swing.JPasswordField
 import javax.swing.JTextField
 import javax.swing.ScrollPaneConstants
 import javax.swing.SwingUtilities
@@ -108,7 +110,7 @@ class LionCPHToolWindowFactory : ToolWindowFactory {
     }
 
     companion object {
-        const val CURRENT_VERSION = "1.9.4"
+        const val CURRENT_VERSION = "1.9.5"
         const val MARKETPLACE_URL = "https://plugins.jetbrains.com/plugin/36278-lioncph"
         private const val MARKETPLACE_UPDATES_API = "https://plugins.jetbrains.com/api/plugins/36278/updates?size=1"
         val panels = ConcurrentHashMap<Project, LionCPHPanel>()
@@ -134,9 +136,11 @@ class LionCPHToolWindowFactory : ToolWindowFactory {
                         .build()
                     val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
                     if (resp.statusCode() != 200) return@runCatching
-                    val arr = JsonParser.parseString(resp.body()).asJsonArray
-                    if (arr.size() == 0) return@runCatching
-                    val remoteVer = arr[0].asJsonObject.get("version")?.asString?.trim().orEmpty()
+                    val parsed = JsonParser.parseString(resp.body())
+                    if (!parsed.isJsonArray) return@runCatching
+                    val arr = parsed.asJsonArray
+                    if (arr.size() == 0 || !arr[0].isJsonObject) return@runCatching
+                    val remoteVer = arr[0].asJsonObject.get("version")?.takeIf { !it.isJsonNull && it.isJsonPrimitive }?.asString?.trim().orEmpty()
                     if (remoteVer.isNotBlank() && compareSemVer(remoteVer, CURRENT_VERSION) > 0) {
                         latestMarketplaceVersion = remoteVer
                         ApplicationManager.getApplication().invokeLater { onFoundNewer() }
@@ -168,6 +172,8 @@ class RunAllAction : AnAction() {
         }
     }
 }
+
+private val GITHUB_ICON: Icon by lazy { IconLoader.getIcon("/icons/github.svg", LionCPHToolWindowFactory::class.java) }
 
 private object CphColors {
     val BG = Color(0x1B, 0x1D, 0x21)
@@ -228,7 +234,7 @@ private class FlatCphButton(
         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
         iconTextGap = 6
         addMouseListener(object : MouseAdapter() {
-            override fun mouseEntered(e: MouseEvent) { hovered = true; repaint() }
+            override fun mouseEntered(e: MouseEvent) { if (isEnabled) { hovered = true; repaint() } }
             override fun mouseExited(e: MouseEvent) { hovered = false; repaint() }
         })
     }
@@ -236,7 +242,12 @@ private class FlatCphButton(
     override fun paintComponent(g: Graphics) {
         val g2 = g.create() as Graphics2D
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
-        val fill = if (model.isPressed) baseColor.darker() else if (hovered) baseColor.brighter() else baseColor
+        val fill = when {
+            !isEnabled -> baseColor.darker()
+            model.isPressed -> baseColor.darker()
+            hovered -> baseColor.brighter()
+            else -> baseColor
+        }
         g2.color = fill
         g2.fillRoundRect(0, 0, width, height, 8, 8)
         if (borderColor != null) {
@@ -441,6 +452,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
     private var currentProblem: ProblemData = ProblemData()
     private lateinit var bottomBar: JPanel
     private val currentResults: MutableMap<String, TestResult> = ConcurrentHashMap()
+    private val resultsByFile: MutableMap<Path, Map<String, TestResult>> = ConcurrentHashMap()
     private var compileError: String = ""
     private var liveVerdict: LiveVerdictUpdate? = null
     private var currentCfRef: CfProblemRef? = null
@@ -453,9 +465,23 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
     private var judgeOptionsExpanded = false
     private var updateBannerDismissed = false
 
+    private val verdictSessionKey = "${project.locationHash}_${System.identityHashCode(this)}"
     @Volatile private var isRunning = false
+    @Volatile private var isPanelDisposed = false
+    private val isOrganizing = AtomicBoolean(false)
+
+    private fun runOnEdtIfAlive(block: () -> Unit) {
+        ApplicationManager.getApplication().invokeLater {
+            if (!isPanelDisposed && !project.isDisposed) {
+                block()
+            }
+        }
+    }
     private val cancelFlag = AtomicBoolean(false)
     private val activeProcesses: MutableSet<Process> = ConcurrentHashMap.newKeySet()
+    private val testRunExecutor = Executors.newFixedThreadPool(4) { r ->
+        Thread(r, "LionCPH-Judge-Worker").apply { isDaemon = true }
+    }
     private lateinit var runAllBtn: FlatCphButton
 
     private val saveDebounceTimer = Timer(350) { saveActiveProblem() }.apply { isRepeats = false }
@@ -480,6 +506,11 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         minimumSize = Dimension(48, 24)
         toolTipText = "Problem Stopwatch — click to Start / Pause (auto-pauses on AC)"
         addActionListener {
+            if (activeCppFile == null) {
+                stopwatchRunning = false
+                refreshTimerBarLabels()
+                return@addActionListener
+            }
             stopwatchRunning = !stopwatchRunning
             refreshTimerBarLabels()
         }
@@ -664,19 +695,27 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         return ext.equals("cpp", true) || ext.equals("cc", true) || ext.equals("cxx", true)
     }
 
+    private fun openFileInEditorAsync(targetPath: Path, onOpenedEdt: (() -> Unit)? = null) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val vFile = runCatching { LocalFileSystem.getInstance().refreshAndFindFileByNioFile(targetPath) }.getOrNull()
+            runOnEdtIfAlive {
+                if (vFile != null) {
+                    runCatching { project.getService(FileEditorManager::class.java).openFile(vFile, true) }
+                }
+                onOpenedEdt?.invoke()
+            }
+        }
+    }
+
     fun rebindCompanionCallbacks() {
         CompanionServerService.rebind(
             rootProvider = { project.basePath?.let { Path.of(it) } }
-        ) { cppFile, _ ->
-            ApplicationManager.getApplication().invokeLater {
-                project.basePath?.let { root ->
-                    CMakeSyncService.triggerCMakeReload(Path.of(root), project)
-                }
-                val vFile = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(cppFile)
-                if (vFile != null) {
-                    project.getService(FileEditorManager::class.java).openFile(vFile, true)
-                }
-                loadCppFile(cppFile)
+        ) { cppFile, _, openInEditor ->
+            project.basePath?.let { root ->
+                CMakeSyncService.triggerCMakeReload(Path.of(root), project)
+            }
+            if (openInEditor) {
+                openFileInEditorAsync(cppFile) { loadCppFile(cppFile) }
             }
         }
     }
@@ -685,22 +724,18 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         CompanionServerService.start(
             primaryPort = port,
             rootProvider = { project.basePath?.let { Path.of(it) } }
-        ) { cppFile, _ ->
-            ApplicationManager.getApplication().invokeLater {
-                project.basePath?.let { root ->
-                    CMakeSyncService.triggerCMakeReload(Path.of(root), project)
-                }
-                val vFile = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(cppFile)
-                if (vFile != null) {
-                    project.getService(FileEditorManager::class.java).openFile(vFile, true)
-                }
-                loadCppFile(cppFile)
+        ) { cppFile, _, openInEditor ->
+            project.basePath?.let { root ->
+                CMakeSyncService.triggerCMakeReload(Path.of(root), project)
+            }
+            if (openInEditor) {
+                openFileInEditorAsync(cppFile) { loadCppFile(cppFile) }
             }
         }
     }
 
     private fun syncActiveEditorFile() {
-        ApplicationManager.getApplication().invokeLater {
+        runOnEdtIfAlive {
             val file = project.getService(FileEditorManager::class.java).selectedFiles.firstOrNull()
             if (file != null && isCppFile(file.extension)) {
                 loadCppFile(Path.of(file.path))
@@ -712,6 +747,14 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
 
     private fun loadCppFile(cppFile: Path) {
         val root = project.basePath?.let { Path.of(it) } ?: return
+        activeCppFile?.let { prev ->
+            val prevNorm = prev.toAbsolutePath().normalize()
+            if (currentResults.isNotEmpty()) {
+                resultsByFile[prevNorm] = HashMap(currentResults)
+            } else {
+                resultsByFile.remove(prevNorm)
+            }
+        }
         activeCppFile = cppFile
         val loaded = CphStorage.loadProblemOrNull(root, cppFile)
         if (loaded != null) {
@@ -722,6 +765,9 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             currentProblem = ProblemData()
         }
         currentResults.clear()
+        resultsByFile[cppFile.toAbsolutePath().normalize()]?.let { savedRes ->
+            currentResults.putAll(savedRes)
+        }
         collapsedMap.clear()
         compileError = ""
         refreshCfNavigation(cppFile)
@@ -745,7 +791,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 syncContestTimerWithCodeforces(ref, showFeedback = false)
             }
             CodeforcesVerdictService.fetchNavigationInfo(ref, settings.cfApiKey, settings.cfApiSecret) { nav ->
-                ApplicationManager.getApplication().invokeLater {
+                runOnEdtIfAlive {
                     if (activeCppFile == targetFile) {
                         currentCfNav = nav
                         renderUi()
@@ -795,6 +841,9 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             }
         }
         activeProcesses.clear()
+        currentResults.entries.forEach { (id, res) ->
+            if (res.status == "RUNNING") currentResults[id] = TestResult(id, "IDLE")
+        }
         setRunningState(false)
         renderUi()
     }
@@ -1082,7 +1131,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 font = Font("Segoe UI", Font.BOLD, 11)
             }, BorderLayout.CENTER)
             vPanel.add(linkLabel("x") {
-                CodeforcesVerdictService.stopPolling()
+                CodeforcesVerdictService.stopPolling(verdictSessionKey)
                 liveVerdict = null
                 renderUi()
             }, BorderLayout.EAST)
@@ -1323,7 +1372,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         grid.add(darkGridButton("URL", AllIcons.Actions.Edit) { editProblemUrlDialog() }.apply {
             toolTipText = "Attach or edit the problem URL (enables Submit & Prev/Next)"
         })
-        grid.add(darkGridButton("GitHub", AllIcons.Vcs.Branch) {
+        grid.add(darkGridButton("GitHub", GITHUB_ICON) {
             BrowserUtil.browse("https://github.com/mostafa16musameh/LionCPH")
         }.apply {
             toolTipText = "Open LionCPH repository on GitHub"
@@ -1431,7 +1480,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 border = JBUI.Borders.empty(2, 6)
             })
             if (res.memoryKb > 0) {
-                val memText = if (res.memoryKb >= 1024) String.format("%.1fMB", res.memoryKb / 1024.0) else "${res.memoryKb}KB"
+                val memText = if (res.memoryKb >= 1024) String.format(java.util.Locale.US, "%.1fMB", res.memoryKb / 1024.0) else "${res.memoryKb}KB"
                 leftInfo.add(RoundedBadgeLabel(memText).apply {
                     foreground = Color(0xC5, 0xD4, 0xE8)
                     badgeBg = Color(0x28, 0x33, 0x42)
@@ -1518,6 +1567,15 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 }
                 if (!currentProblem.useCustomChecker) {
                     rightLinks.add(linkLabel("Set") {
+                        if (res.stdout.contains("... [Output truncated at ")) {
+                            JOptionPane.showMessageDialog(
+                                this@LionCPHPanel,
+                                "Output was truncated at 512 KB and cannot be set as Expected Output.",
+                                "LionCPH",
+                                JOptionPane.WARNING_MESSAGE
+                            )
+                            return@linkLabel
+                        }
                         tc.output = res.stdout
                         saveActiveProblem()
                         runSingleTest(tc.id)
@@ -1614,8 +1672,21 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             font = Font("Segoe UI", Font.BOLD, 11)
             preferredSize = Dimension(100, 30)
             addActionListener {
+                val trimmedPath = pathField.text.trim()
+                if (check.isSelected) {
+                    val exists = trimmedPath.isNotEmpty() && runCatching { Files.isRegularFile(Path.of(trimmedPath)) }.getOrDefault(false)
+                    if (!exists) {
+                        JOptionPane.showMessageDialog(
+                            this@LionCPHPanel,
+                            "Please select a valid Python checker file (.py) before enabling Custom Checker.",
+                            "LionCPH — Custom Checker",
+                            JOptionPane.WARNING_MESSAGE
+                        )
+                        return@addActionListener
+                    }
+                }
                 currentProblem.useCustomChecker = check.isSelected
-                currentProblem.customCheckerPath = pathField.text.trim()
+                currentProblem.customCheckerPath = trimmedPath
                 saveActiveProblem()
                 renderUi()
             }
@@ -1626,35 +1697,38 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             addActionListener {
                 val root = project.basePath?.let { Path.of(it) } ?: return@addActionListener
                 val sampleFile = root.resolve(".cph").resolve("checker.py")
-                Files.createDirectories(sampleFile.parent)
-                if (!Files.exists(sampleFile)) {
-                    Files.writeString(
-                        sampleFile,
-                        """
-                        import sys
-                        # Usage: checker.py <input_file> <expected_file> <received_file>
-                        # Exit 0 = Passed, Non-zero = Failed
-                        inp = open(sys.argv[1]).read().strip()
-                        exp = open(sys.argv[2]).read().strip()
-                        got = open(sys.argv[3]).read().strip()
-                        if got == exp:
-                            sys.exit(0)
-                        print(f"Expected {exp!r}, got {got!r}")
-                        sys.exit(1)
-                        """.trimIndent() + "\n",
-                        StandardCharsets.UTF_8
-                    )
+                val wroteOk = runCatching {
+                    Files.createDirectories(sampleFile.parent)
+                    if (!Files.exists(sampleFile)) {
+                        Files.writeString(
+                            sampleFile,
+                            """
+                            import sys
+                            # Usage: checker.py <input_file> <expected_file> <received_file>
+                            # Exit 0 = Passed, Non-zero = Failed
+                            inp = open(sys.argv[1]).read().strip()
+                            exp = open(sys.argv[2]).read().strip()
+                            got = open(sys.argv[3]).read().strip()
+                            if got == exp:
+                                sys.exit(0)
+                            print(f"Expected {exp!r}, got {got!r}")
+                            sys.exit(1)
+                            """.trimIndent() + "\n",
+                            StandardCharsets.UTF_8
+                        )
+                    }
+                    true
+                }.getOrElse { ex ->
+                    JOptionPane.showMessageDialog(this@LionCPHPanel, "Could not create sample checker: ${ex.message}", "LionCPH", JOptionPane.ERROR_MESSAGE)
+                    false
                 }
+                if (!wroteOk) return@addActionListener
                 pathField.text = sampleFile.toAbsolutePath().toString()
                 check.isSelected = true
                 currentProblem.useCustomChecker = true
                 currentProblem.customCheckerPath = pathField.text
                 saveActiveProblem()
-                ApplicationManager.getApplication().invokeLater {
-                    LocalFileSystem.getInstance().refreshAndFindFileByNioFile(sampleFile)?.let {
-                        project.getService(FileEditorManager::class.java).openFile(it, true)
-                    }
-                }
+                openFileInEditorAsync(sampleFile)
                 renderUi()
             }
         }
@@ -1707,6 +1781,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 0 -> {
                     if (isRunning) stopRunningTests()
                     currentResults.clear()
+                    resultsByFile.remove(cppFile.toAbsolutePath().normalize())
                     compileError = ""
                     liveVerdict = null
                     collapsedMap.clear()
@@ -1723,6 +1798,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                     hasProblem = false
                     currentProblem = ProblemData()
                     currentResults.clear()
+                    resultsByFile.remove(cppFile.toAbsolutePath().normalize())
                     compileError = ""
                     liveVerdict = null
                     collapsedMap.clear()
@@ -1742,6 +1818,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
     }
 
     private fun flashCopied(label: JLabel) {
+        if (label.text == "Copied!") return
         val prev = label.text
         label.text = "Copied!"
         label.foreground = CphColors.GREEN_TEXT
@@ -1845,7 +1922,12 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             "Paste or edit the Codeforces / Online Judge problem URL\n(enables Submit, Open Problem, and Prev/Next navigation):",
             currentProblem.url
         ) ?: return
-        currentProblem.url = entered.trim()
+        val trimmedUrl = entered.trim()
+        currentProblem.url = if (trimmedUrl.isNotEmpty() && !trimmedUrl.contains("://") && trimmedUrl.contains(".")) {
+            "https://$trimmedUrl"
+        } else {
+            trimmedUrl
+        }
         saveActiveProblem()
         refreshCfNavigation(activeCppFile)
         renderUi()
@@ -1894,18 +1976,64 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             if (picked != 0) return
         }
 
-        val moved = FolderOrganizerService.organizeExistingRootFiles(root, settings)
-        LocalFileSystem.getInstance().refresh(true)
-        if (moved > 0) {
-            CMakeSyncService.triggerCMakeReload(root, project)
+        runOrganizeAsync(root) { moved ->
+            JOptionPane.showMessageDialog(
+                this,
+                if (moved > 0) "Organized $moved problem file(s) into clean Group/Sheet/Contest/Problemset folders and reloaded CMake." else "All LionCPH problem files are already in their clean folders.",
+                "LionCPH Workspace Organizer",
+                JOptionPane.INFORMATION_MESSAGE
+            )
         }
-        JOptionPane.showMessageDialog(
-            this,
-            if (moved > 0) "Organized $moved problem file(s) into clean Group/Sheet/Contest/Problemset folders and reloaded CMake." else "All LionCPH problem files are already in their clean folders.",
-            "LionCPH Workspace Organizer",
-            JOptionPane.INFORMATION_MESSAGE
-        )
-        renderUi()
+    }
+
+    private fun runOrganizeAsync(root: Path, onDone: (Int) -> Unit) {
+        if (!isOrganizing.compareAndSet(false, true)) return
+        val settingsSnapshot = settings.copy()
+        val organizeBanner = LiveVerdictUpdate("Organizing workspace folders...", "WAITING")
+        if (liveVerdict == null) {
+            liveVerdict = organizeBanner
+            renderUi()
+        }
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val movedMap = try {
+                FolderOrganizerService.organizeExistingRootFilesWithMap(root, settingsSnapshot)
+            } catch (_: Exception) {
+                emptyMap()
+            } finally {
+                isOrganizing.set(false)
+            }
+            val moved = movedMap.size
+            runOnEdtIfAlive {
+                if (liveVerdict == organizeBanner) liveVerdict = null
+                LocalFileSystem.getInstance().refresh(true)
+                if (moved > 0) {
+                    for ((oldP, newP) in movedMap) {
+                        val oldNorm = oldP.toAbsolutePath().normalize()
+                        val newNorm = newP.toAbsolutePath().normalize()
+                        resultsByFile.remove(oldNorm)?.let { resultsByFile[newNorm] = it }
+                    }
+                    CMakeSyncService.triggerCMakeReload(root, project)
+                    activeCppFile?.let { cur ->
+                        val curNorm = cur.toAbsolutePath().normalize()
+                        val relocated = movedMap[curNorm]
+                        if (relocated != null && Files.isRegularFile(relocated)) {
+                            if (currentResults.isNotEmpty()) {
+                                resultsByFile[relocated.toAbsolutePath().normalize()] = HashMap(currentResults)
+                                currentResults.clear()
+                            }
+                            openFileInEditorAsync(relocated) { loadCppFile(relocated) }
+                        } else if (!Files.isRegularFile(cur)) {
+                            activeCppFile = null
+                            hasProblem = false
+                            currentResults.clear()
+                            compileError = ""
+                        }
+                    }
+                }
+                renderUi()
+                onDone(moved)
+            }
+        }
     }
 
     private fun renameGroupFolderDialog(root: Path) {
@@ -1935,18 +2063,15 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         if (newName.isBlank()) return
 
         FolderOrganizerService.saveGroupName(root, groupId, newName.trim())
-        val moved = FolderOrganizerService.organizeExistingRootFiles(root, settings)
-        LocalFileSystem.getInstance().refresh(true)
-        if (moved > 0) {
-            CMakeSyncService.triggerCMakeReload(root, project)
+        val cleanDisplay = FolderOrganizerService.sanitizeSegment(newName, 40)
+        runOrganizeAsync(root) { moved ->
+            JOptionPane.showMessageDialog(
+                this,
+                "Saved Group '$groupId' as '$cleanDisplay' and moved $moved file(s).",
+                "Rename Group Folder",
+                JOptionPane.INFORMATION_MESSAGE
+            )
         }
-        JOptionPane.showMessageDialog(
-            this,
-            "Saved Group '$groupId' as '${FolderOrganizerService.sanitizeSegment(newName, 40)}' and moved $moved file(s).",
-            "Rename Group Folder",
-            JOptionPane.INFORMATION_MESSAGE
-        )
-        renderUi()
     }
 
     private fun formatHms(totalSec: Long): String {
@@ -1954,7 +2079,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         val h = s / 3600L
         val m = (s % 3600L) / 60L
         val sec = s % 60L
-        return if (h > 0L) "%02d:%02d:%02d".format(h, m, sec) else "%02d:%02d".format(m, sec)
+        return if (h > 0L) "%02d:%02d:%02d".format(java.util.Locale.US, h, m, sec) else "%02d:%02d".format(java.util.Locale.US, m, sec)
     }
 
     private fun currentContestRemainingSec(): Long {
@@ -2021,7 +2146,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             settings.cfApiKey,
             settings.cfApiSecret
         ) { sync ->
-            ApplicationManager.getApplication().invokeLater {
+            runOnEdtIfAlive {
                 syncedContestId = sync.contestId
                 when (sync.mode) {
                     "LIVE", "VIRTUAL", "BEFORE" -> {
@@ -2044,12 +2169,38 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                     else -> {
                         refreshTimerBarLabels()
                         if (showFeedback) {
-                            val hint = if (settings.cfHandle.isBlank()) {
-                                "${sync.message}\n\nTip: Set your Codeforces Handle in Settings to auto-sync active Virtual contests!"
+                            if (sync.mode == "FINISHED" && sync.durationSeconds > 0L) {
+                                val durText = formatHms(sync.durationSeconds)
+                                val choices = arrayOf("Start Virtual ($durText)", "Cancel")
+                                val picked = JOptionPane.showOptionDialog(
+                                    this,
+                                    "${sync.contestName} — Official Length: $durText\n\n" +
+                                        "Start Virtual countdown with $durText now?\n" +
+                                        "(Will auto-lock to Codeforces's exact server clock on your first Submit!)",
+                                    "LionCPH Contest Timer Sync",
+                                    JOptionPane.DEFAULT_OPTION,
+                                    JOptionPane.INFORMATION_MESSAGE,
+                                    null,
+                                    choices,
+                                    choices[0]
+                                )
+                                if (picked == 0) {
+                                    contestPausedRemainingSec = sync.durationSeconds
+                                    contestEndEpochMs = System.currentTimeMillis() + sync.durationSeconds * 1000L
+                                    contestRunning = true
+                                    contestEndAlerted = false
+                                    contestModeTag = "VIRT"
+                                    contestLabelName = sync.contestName
+                                    refreshTimerBarLabels()
+                                }
                             } else {
-                                "${sync.message}\n\nYou can still pick a manual duration (2h / 2.5h / 3h / 5h / Custom) from the Contest Timer menu."
+                                val hint = if (settings.cfHandle.isBlank()) {
+                                    "${sync.message}\n\nTip: Set your Codeforces Handle in Settings to auto-sync active Virtual contests!"
+                                } else {
+                                    "${sync.message}\n\nYou can pick a duration (1:30h / 2h / 2:30h / 3h / 5h / Custom HH:MM:SS) from the Contest Timer menu."
+                                }
+                                JOptionPane.showMessageDialog(this, hint, "LionCPH Contest Timer Sync", JOptionPane.INFORMATION_MESSAGE)
                             }
-                            JOptionPane.showMessageDialog(this, hint, "LionCPH Contest Timer Sync", JOptionPane.INFORMATION_MESSAGE)
                         }
                     }
                 }
@@ -2139,11 +2290,12 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         if (rem > 0L || contestEndAlerted || contestModeTag.isNotEmpty()) {
             options.add("Turn Off / Reset Timer")
         }
+        options.add("1:30h (University Sheet)")
         options.add("2:00h (CF Div.2 / Div.3)")
         options.add("2:30h (CF Div.1 / Div.2)")
         options.add("3:00h (Practice Sheet)")
         options.add("5:00h (ICPC / Virtual)")
-        options.add("Custom Minutes...")
+        options.add("Custom Time (min or HH:MM:SS)...")
 
         val choice = JOptionPane.showInputDialog(
             this,
@@ -2181,16 +2333,39 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 contestModeTag = ""
                 contestLabelName = ""
             }
+            "1:30h (University Sheet)" -> startContestCountdown(90, "University Sheet")
             "2:00h (CF Div.2 / Div.3)" -> startContestCountdown(120, "CF Round")
             "2:30h (CF Div.1 / Div.2)" -> startContestCountdown(150, "CF Round")
             "3:00h (Practice Sheet)" -> startContestCountdown(180, "Practice Sheet")
             "5:00h (ICPC / Virtual)" -> startContestCountdown(300, "ICPC Virtual")
-            "Custom Minutes..." -> {
-                val raw = JOptionPane.showInputDialog(this, "Enter countdown duration in minutes (e.g., 90):", "120") ?: return
-                val mins = raw.trim().toLongOrNull()
-                if (mins != null && mins > 0L) {
-                    startContestCountdown(mins, "Custom Timer")
+            "Custom Time (min or HH:MM:SS)..." -> {
+                val raw = JOptionPane.showInputDialog(this, "Enter minutes (e.g., 90) or remaining time (e.g., 1:41:17 or 1:30):", "90") ?: return
+                val trimmed = raw.trim()
+                val totalSec: Long? = if (trimmed.contains(":")) {
+                    val parts = trimmed.split(":").map { it.trim().toLongOrNull() }
+                    when {
+                        parts.size == 3 && parts.all { it != null && it >= 0L } -> parts[0]!! * 3600L + parts[1]!! * 60L + parts[2]!!
+                        parts.size == 2 && parts.all { it != null && it >= 0L } -> parts[0]!! * 3600L + parts[1]!! * 60L
+                        else -> null
+                    }
+                } else {
+                    trimmed.toLongOrNull()?.let { it * 60L }
                 }
+                if (totalSec == null || totalSec !in 60L..(10080L * 60L)) {
+                    JOptionPane.showMessageDialog(
+                        this,
+                        "Please enter a valid duration (1–10080 minutes, or HH:MM:SS like 1:41:17).",
+                        "LionCPH Contest Timer",
+                        JOptionPane.WARNING_MESSAGE
+                    )
+                    return
+                }
+                contestPausedRemainingSec = totalSec
+                contestEndEpochMs = System.currentTimeMillis() + totalSec * 1000L
+                contestRunning = true
+                contestEndAlerted = false
+                contestModeTag = "CUSTOM"
+                contestLabelName = "Custom Timer"
             }
         }
         refreshTimerBarLabels()
@@ -2249,11 +2424,19 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             font = Font("JetBrains Mono", Font.PLAIN, 12)
             border = JBUI.Borders.empty(6)
         }
-        snippetList.addListSelectionListener {
+        var lastSelectedIdx = -1
+        snippetList.addListSelectionListener { ev ->
+            if (ev.valueIsAdjusting) return@addListSelectionListener
+            if (lastSelectedIdx in snippets.indices && lastSelectedIdx != snippetList.selectedIndex) {
+                snippets[lastSelectedIdx].code = codeArea.text
+            }
             val idx = snippetList.selectedIndex
             if (idx in snippets.indices) {
                 codeArea.text = snippets[idx].code
                 codeArea.caretPosition = 0
+                lastSelectedIdx = idx
+            } else {
+                lastSelectedIdx = -1
             }
         }
         if (snippets.isNotEmpty()) snippetList.selectedIndex = 0
@@ -2277,6 +2460,12 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 if (idx in snippets.indices) {
                     snippets[idx].code = codeArea.text
                     CphStorage.saveSnippets(root, snippets)
+                    text = "Saved!"
+                    foreground = CphColors.GREEN_TEXT
+                    Timer(900) {
+                        text = "Save"
+                        foreground = Color.WHITE
+                    }.apply { isRepeats = false }.start()
                 }
             }
         }
@@ -2285,6 +2474,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             addActionListener {
                 val idx = snippetList.selectedIndex
                 if (idx in snippets.indices) {
+                    lastSelectedIdx = -1
                     snippets.removeAt(idx)
                     listModel.remove(idx)
                     CphStorage.saveSnippets(root, snippets)
@@ -2317,6 +2507,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             actions,
             actions[0]
         )
+        if (picked != 0 && picked != 1) return
         val idx = snippetList.selectedIndex
         if (idx in snippets.indices) {
             snippets[idx].code = codeArea.text
@@ -2327,13 +2518,17 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
 
         if (picked == 0) {
             val editor = project.getService(FileEditorManager::class.java).selectedTextEditor
-            if (editor != null) {
-                WriteCommandAction.runWriteCommandAction(project) {
-                    val offset = editor.caretModel.offset
-                    editor.document.insertString(offset, chosenCode)
-                    editor.caretModel.moveToOffset(offset + chosenCode.length)
-                }
-            } else {
+            val inserted = if (editor != null && editor.document.isWritable) {
+                runCatching {
+                    WriteCommandAction.runWriteCommandAction(project) {
+                        val offset = editor.caretModel.offset
+                        editor.document.insertString(offset, chosenCode)
+                        editor.caretModel.moveToOffset(offset + chosenCode.length)
+                    }
+                    true
+                }.getOrDefault(false)
+            } else false
+            if (!inserted) {
                 CopyPasteManager.getInstance().setContents(StringSelection(chosenCode))
                 JOptionPane.showMessageDialog(this, "No active editor focused — snippet copied to clipboard.", "LionCPH Snippets", JOptionPane.INFORMATION_MESSAGE)
             }
@@ -2350,7 +2545,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         val defaultTimeField = JTextField(settings.defaultTimeLimitMs.toString(), 24)
         val cfHandleField = JTextField(settings.cfHandle, 24)
         val cfApiKeyField = JTextField(settings.cfApiKey, 24)
-        val cfApiSecretField = JTextField(settings.cfApiSecret, 24)
+        val cfApiSecretField = JPasswordField(settings.cfApiSecret, 24)
         val pythonField = JTextField(settings.pythonPath, 24)
         val portField = JTextField(settings.companionPort.toString(), 24)
         val trimBox = JCheckBox("Ignore trailing whitespace", settings.ignoreTrailingSpaces)
@@ -2397,10 +2592,9 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                     settings.organizationMode = previewMode
                     settings.organizeByContest = true
                     CphStorage.saveSettings(root, settings)
-                    val moved = FolderOrganizerService.organizeExistingRootFiles(root, settings)
-                    LocalFileSystem.getInstance().refresh(true)
-                    CMakeSyncService.triggerCMakeReload(root, project)
-                    JOptionPane.showMessageDialog(this@LionCPHPanel, "Organized $moved problem file(s) and triggered CMake reload.", "LionCPH Organizer", JOptionPane.INFORMATION_MESSAGE)
+                    runOrganizeAsync(root) { moved ->
+                        JOptionPane.showMessageDialog(this@LionCPHPanel, "Organized $moved problem file(s) and triggered CMake reload.", "LionCPH Organizer", JOptionPane.INFORMATION_MESSAGE)
+                    }
                 }
             }
         }
@@ -2468,7 +2662,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             }
             settings.cfHandle = cfHandleField.text.trim()
             settings.cfApiKey = cfApiKeyField.text.trim()
-            settings.cfApiSecret = cfApiSecretField.text.trim()
+            settings.cfApiSecret = String(cfApiSecretField.password).trim()
             CodeforcesVerdictService.clearProblemsCache()
             syncedContestId = null
             lastAutoSyncAttemptMs = 0L
@@ -2482,11 +2676,31 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             }
             settings.organizeByContest = (settings.organizationMode != "flat")
             settings.fileNameStyle = if (nameStyleCombo.selectedIndex == 1) "short" else "full"
-            val newPort = portField.text.trim().toIntOrNull() ?: 27121
+            val parsedPort = portField.text.trim().toIntOrNull()
+            val newPort = if (parsedPort != null && parsedPort in 1..65535) {
+                parsedPort
+            } else {
+                JOptionPane.showMessageDialog(
+                    this,
+                    "Invalid Companion port '${portField.text.trim()}'. Keeping port ${settings.companionPort} (valid range: 1–65535).",
+                    "LionCPH Settings",
+                    JOptionPane.WARNING_MESSAGE
+                )
+                settings.companionPort
+            }
             val portChanged = newPort != settings.companionPort
             settings.companionPort = newPort
             JudgeService.clearCompileCache()
-            project.basePath?.let { CphStorage.saveSettings(Path.of(it), settings) }
+            val savedOk = project.basePath?.let { CphStorage.saveSettings(Path.of(it), settings, updateSecret = true) } ?: true
+            if (!savedOk) {
+                JOptionPane.showMessageDialog(
+                    this,
+                    "Warning: Could not persist your Codeforces API Secret to your user home directory (~/.lioncph/secrets.json).\n" +
+                        "Any previously saved secret was preserved untouched; please check folder write permissions.",
+                    "LionCPH Settings — Secret Save Failed",
+                    JOptionPane.WARNING_MESSAGE
+                )
+            }
             saveActiveProblem()
             if (portChanged) startCompanionListener(newPort)
             renderUi()
@@ -2560,17 +2774,17 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             JOptionPane.PLAIN_MESSAGE
         )
         if (res == JOptionPane.OK_OPTION && area.text.isNotBlank()) {
-            val imported = CompanionServerService.importFromJson(root, area.text)
-            if (imported != null) {
-                CMakeSyncService.triggerCMakeReload(root, project)
-                ApplicationManager.getApplication().invokeLater {
-                    LocalFileSystem.getInstance().refreshAndFindFileByNioFile(imported.first)?.let {
-                        project.getService(FileEditorManager::class.java).openFile(it, true)
+            val rawJson = area.text
+            ApplicationManager.getApplication().executeOnPooledThread {
+                val imported = CompanionServerService.importFromJson(root, rawJson)
+                runOnEdtIfAlive {
+                    if (imported != null) {
+                        CMakeSyncService.triggerCMakeReload(root, project)
+                        openFileInEditorAsync(imported.first) { loadCppFile(imported.first) }
+                    } else {
+                        JOptionPane.showMessageDialog(this, "Invalid JSON format.", "LionCPH", JOptionPane.ERROR_MESSAGE)
                     }
                 }
-                loadCppFile(imported.first)
-            } else {
-                JOptionPane.showMessageDialog(this, "Invalid JSON format.", "LionCPH", JOptionPane.ERROR_MESSAGE)
             }
         }
     }
@@ -2595,7 +2809,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         }.getOrDefault(emptyList()).sortedBy { p ->
             val stem = p.fileName.toString().substringBeforeLast('.')
             val num = Regex("""(\d+)""").find(stem)?.groupValues?.get(1)?.toLongOrNull() ?: Long.MAX_VALUE
-            "%012d_%s".format(num, stem.lowercase())
+            "%012d_%s".format(java.util.Locale.US, num, stem.lowercase())
         }
 
         if (inFiles.isEmpty()) {
@@ -2625,17 +2839,126 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
      * - Requires explicit human / non-AI confirmation
      * - Auto-sends via cph-submit if Chrome extension is active, or copies code & opens direct Submit URL otherwise
      */
-    private fun scanCodeForContestPitfalls(code: String): List<String> {
-        val warnings = mutableListOf<String>()
-        val hasOnlineJudgeGuard = code.contains("ONLINE_JUDGE")
-        if (Regex("""\bfreopen\s*\(""").containsMatchIn(code) && !hasOnlineJudgeGuard) {
-            warnings.add("Unprotected freopen(...) detected without #ifndef ONLINE_JUDGE.")
+    private fun stripCppCommentsPreservingStrings(code: String): String {
+        val sb = StringBuilder(code.length)
+        var i = 0
+        val n = code.length
+        while (i < n) {
+            val ch = code[i]
+            val next = if (i + 1 < n) code[i + 1] else '\u0000'
+            when {
+                ch == '"' || ch == '\'' -> {
+                    val quote = ch
+                    sb.append(ch); i++
+                    while (i < n) {
+                        val c = code[i]
+                        sb.append(c); i++
+                        if (c == '\\' && i < n) {
+                            sb.append(code[i]); i++
+                        } else if (c == quote) {
+                            break
+                        }
+                    }
+                }
+                ch == '/' && next == '/' -> {
+                    i += 2
+                    while (i < n && code[i] != '\n') i++
+                }
+                ch == '/' && next == '*' -> {
+                    i += 2
+                    while (i + 1 < n && !(code[i] == '*' && code[i + 1] == '/')) {
+                        if (code[i] == '\n') sb.append('\n')
+                        i++
+                    }
+                    i = (i + 2).coerceAtMost(n)
+                }
+                else -> {
+                    sb.append(ch); i++
+                }
+            }
         }
-        val hasLoop = Regex("""\b(for|while)\s*\(""").containsMatchIn(code)
-        if (hasLoop && Regex("""\bendl\b""").containsMatchIn(code)) {
+        return sb.toString()
+    }
+
+    private fun scanCodeForContestPitfalls(code: String): List<String> {
+        val stripped = stripCppCommentsPreservingStrings(code)
+        val warnings = mutableListOf<String>()
+        var unprotectedFreopen = false
+        var unprotectedDebug = false
+        var hasLoop = false
+        var hasEndl = false
+
+        // 0 = OTHER (#ifdef _WIN32, etc.), 1 = OJ_SKIP (#ifndef ONLINE_JUDGE), 2 = OJ_ACTIVE (#ifdef ONLINE_JUDGE)
+        val ojGuardStack = ArrayDeque<Int>()
+        var insideOjSkipBlock = false
+        val freopenRx = Regex("""\bfreopen\s*\(""")
+        val debugRx = Regex("""\bcerr\s*<<|\bdebug\s*\(""")
+        val loopRx = Regex("""\b(for|while)\s*\(""")
+        val endlRx = Regex("""\bendl\b""")
+
+        for (rawLine in stripped.lines()) {
+            val trimmed = rawLine.trim()
+            if (trimmed.startsWith("#")) {
+                when {
+                    Regex("""^#\s*ifndef\s+ONLINE_JUDGE\b""").containsMatchIn(trimmed) ||
+                        Regex("""^#\s*if\s+!\s*defined\s*\(?\s*ONLINE_JUDGE\b""").containsMatchIn(trimmed) -> {
+                        ojGuardStack.addLast(1)
+                        insideOjSkipBlock = ojGuardStack.any { it == 1 }
+                    }
+                    Regex("""^#\s*ifdef\s+ONLINE_JUDGE\b""").containsMatchIn(trimmed) ||
+                        Regex("""^#\s*if\s+defined\s*\(?\s*ONLINE_JUDGE\b""").containsMatchIn(trimmed) -> {
+                        ojGuardStack.addLast(2)
+                        insideOjSkipBlock = ojGuardStack.any { it == 1 }
+                    }
+                    Regex("""^#\s*if(def|ndef)?\b""").containsMatchIn(trimmed) -> {
+                        ojGuardStack.addLast(0)
+                    }
+                    Regex("""^#\s*else\b""").containsMatchIn(trimmed) -> {
+                        if (ojGuardStack.isNotEmpty()) {
+                            val top = ojGuardStack.removeLast()
+                            val flipped = when (top) {
+                                1 -> 2
+                                2 -> 1
+                                else -> 0
+                            }
+                            ojGuardStack.addLast(flipped)
+                            insideOjSkipBlock = ojGuardStack.any { it == 1 }
+                        }
+                    }
+                    Regex("""^#\s*elif\b""").containsMatchIn(trimmed) -> {
+                        if (ojGuardStack.isNotEmpty()) {
+                            val top = ojGuardStack.removeLast()
+                            val nextState = when {
+                                Regex("""defined\s*\(?\s*ONLINE_JUDGE\b""").containsMatchIn(trimmed) && !trimmed.contains("!") -> 2
+                                top == 1 -> 2
+                                else -> 0
+                            }
+                            ojGuardStack.addLast(nextState)
+                            insideOjSkipBlock = ojGuardStack.any { it == 1 }
+                        }
+                    }
+                    Regex("""^#\s*endif\b""").containsMatchIn(trimmed) -> {
+                        if (ojGuardStack.isNotEmpty()) ojGuardStack.removeLast()
+                        insideOjSkipBlock = ojGuardStack.any { it == 1 }
+                    }
+                }
+                continue
+            }
+            if (!insideOjSkipBlock) {
+                if (freopenRx.containsMatchIn(rawLine)) unprotectedFreopen = true
+                if (debugRx.containsMatchIn(rawLine)) unprotectedDebug = true
+            }
+            if (loopRx.containsMatchIn(rawLine)) hasLoop = true
+            if (endlRx.containsMatchIn(rawLine)) hasEndl = true
+        }
+
+        if (unprotectedFreopen) {
+            warnings.add("Unprotected freopen(...) detected outside #ifndef ONLINE_JUDGE.")
+        }
+        if (hasLoop && hasEndl) {
             warnings.add("std::endl detected alongside loops (use '\\n' to avoid TLE on large outputs).")
         }
-        if ((Regex("""\bcerr\s*<<""").containsMatchIn(code) || Regex("""\bdebug\s*\(""").containsMatchIn(code)) && !hasOnlineJudgeGuard) {
+        if (unprotectedDebug) {
             warnings.add("Debug output (cerr / debug(...)) found outside #ifndef ONLINE_JUDGE.")
         }
         return warnings
@@ -2755,9 +3078,25 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         // Start live Codeforces verdict polling if handle is provided
         if (enteredHandle.isNotBlank() && cfRef != null) {
             val nowSec = System.currentTimeMillis() / 1000L
-            CodeforcesVerdictService.startPolling(enteredHandle, cfRef, settings.cfApiKey, settings.cfApiSecret, nowSec) { update ->
-                ApplicationManager.getApplication().invokeLater {
+            CodeforcesVerdictService.startPolling(enteredHandle, cfRef, settings.cfApiKey, settings.cfApiSecret, nowSec, sessionKey = verdictSessionKey) { update ->
+                runOnEdtIfAlive {
                     liveVerdict = update
+                    if (update.virtualStartEpochSec > 0L) {
+                        if (update.contestDurationSec > 0L) {
+                            val vEndMs = (update.virtualStartEpochSec + update.contestDurationSec) * 1000L
+                            if (vEndMs > System.currentTimeMillis()) {
+                                contestEndEpochMs = vEndMs
+                                contestPausedRemainingSec = ((vEndMs - System.currentTimeMillis()) / 1000L).coerceAtLeast(0L)
+                                contestRunning = true
+                                contestEndAlerted = false
+                                contestModeTag = "VIRT"
+                                refreshTimerBarLabels()
+                            }
+                        } else if (!contestRunning || contestModeTag != "VIRT") {
+                            syncedContestId = null
+                            syncContestTimerWithCodeforces(cfRef, showFeedback = false)
+                        }
+                    }
                     if (update.state == "OK") {
                         stopwatchRunning = false
                         refreshTimerBarLabels()
@@ -2792,12 +3131,13 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             project.basePath?.let { CphStorage.saveSettings(Path.of(it), settings) }
         }
 
-        val pane = JEditorPane("text/html", "<html><body style='background:#1e1e1e;color:#cccccc;font-family:Segoe UI,sans-serif;padding:16px;'>Loading latest submissions for <b>${settings.cfHandle}</b>...</body></html>").apply {
+        fun escHtml(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;")
+        val pane = JEditorPane("text/html", "<html><body style='background:#1e1e1e;color:#cccccc;font-family:Segoe UI,sans-serif;padding:16px;'>Loading latest submissions for <b>${escHtml(settings.cfHandle)}</b>...</body></html>").apply {
             isEditable = false
             background = CphColors.BG
             addHyperlinkListener { ev ->
                 if (ev.eventType == HyperlinkEvent.EventType.ACTIVATED) {
-                    ev.url?.toString()?.let { BrowserUtil.browse(it) }
+                    ev.url?.toString()?.takeIf { it.startsWith("https://", true) || it.startsWith("http://", true) }?.let { BrowserUtil.browse(it) }
                 }
             }
         }
@@ -2809,16 +3149,15 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             settings.cfApiKey,
             settings.cfApiSecret
         ) { rows, error ->
-            ApplicationManager.getApplication().invokeLater {
+            runOnEdtIfAlive {
                 if (error != null) {
-                    pane.text = "<html><body style='background:#1e1e1e;color:#f14c4c;font-family:Segoe UI,sans-serif;padding:16px;'>$error</body></html>"
-                    return@invokeLater
+                    pane.text = "<html><body style='background:#1e1e1e;color:#f14c4c;font-family:Segoe UI,sans-serif;padding:16px;'>${escHtml(error)}</body></html>"
+                    return@runOnEdtIfAlive
                 }
                 if (rows.isEmpty()) {
-                    pane.text = "<html><body style='background:#1e1e1e;color:#cccccc;font-family:Segoe UI,sans-serif;padding:16px;'>No recent submissions found for <b>${settings.cfHandle}</b>.</body></html>"
-                    return@invokeLater
+                    pane.text = "<html><body style='background:#1e1e1e;color:#cccccc;font-family:Segoe UI,sans-serif;padding:16px;'>No recent submissions found for <b>${escHtml(settings.cfHandle)}</b>.</body></html>"
+                    return@runOnEdtIfAlive
                 }
-                fun esc(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 val trs = StringBuilder()
                 rows.forEach { r ->
                     val vColor = when (r.verdict) {
@@ -2829,15 +3168,16 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                     val vText = if (r.verdict == "OK") "Accepted" else "${r.verdict.replace('_', ' ')} (test ${r.passedTests + 1})"
                     trs.append(
                         "<tr>" +
-                            "<td><a style='color:#4ea1f3;' href='${r.submissionUrl}'>#${r.id}</a></td>" +
-                            "<td>${esc(r.problemLabel)}</td>" +
-                            "<td style='color:$vColor;font-weight:bold;'>${esc(vText)}</td>" +
-                            "<td>${r.timeMs} ms</td>" +
-                            "<td>${r.memoryMb} MB</td>" +
+                            "<td><a style='color:#4ea1f3;' href='${escHtml(r.submissionUrl)}'>#${r.id}</a></td>" +
+                            "<td>${escHtml(r.problemLabel)}</td>" +
+                            "<td style='color:$vColor;font-weight:bold;'>${escHtml(vText)}</td>" +
+                            "<td style='white-space:nowrap;'>${r.timeMs} ms</td>" +
+                            "<td style='white-space:nowrap;'>${escHtml(r.memoryMb)} MB</td>" +
                             "</tr>"
                     )
                 }
-                val myUrl = currentCfRef?.mySubmissionsUrl ?: "https://codeforces.com/submissions/${settings.cfHandle}"
+                val encodedHandle = java.net.URLEncoder.encode(settings.cfHandle, StandardCharsets.UTF_8)
+                val myUrl = currentCfRef?.mySubmissionsUrl ?: "https://codeforces.com/submissions/$encodedHandle"
                 pane.text = """
                     <html><head><style>
                     body { background:#1e1e1e; color:#d4d4d4; font-family:Segoe UI,sans-serif; font-size:12px; margin:8px; }
@@ -2845,7 +3185,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                     th { background:#252526; color:#bbb; text-align:left; padding:6px 8px; border-bottom:1px solid #3c3c3c; }
                     td { padding:6px 8px; border-bottom:1px solid #2b2b2e; }
                     </style></head><body>
-                    <div style='margin-bottom:8px;'>Latest submissions for <b>${esc(settings.cfHandle)}</b> — <a style='color:#4ea1f3;' href='$myUrl'>Open All in Browser</a></div>
+                    <div style='margin-bottom:8px;'>Latest submissions for <b>${escHtml(settings.cfHandle)}</b> — <a style='color:#4ea1f3;' href='${escHtml(myUrl)}'>Open All in Browser</a></div>
                     <table>
                       <tr><th>ID</th><th>Problem</th><th>Verdict</th><th>Time</th><th>Mem</th></tr>
                       $trs
@@ -2865,23 +3205,23 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             background = CphColors.BG
             addHyperlinkListener { ev ->
                 if (ev.eventType == HyperlinkEvent.EventType.ACTIVATED) {
-                    ev.url?.toString()?.let { BrowserUtil.browse(it) }
+                    ev.url?.toString()?.takeIf { it.startsWith("https://", true) || it.startsWith("http://", true) }?.let { BrowserUtil.browse(it) }
                 }
             }
         }
         val scroll = JBScrollPane(pane).apply { preferredSize = Dimension(680, 380) }
 
         CodeforcesVerdictService.fetchUpcomingContests { contests, error ->
-            ApplicationManager.getApplication().invokeLater {
+            runOnEdtIfAlive {
                 if (error != null) {
-                    pane.text = "<html><body style='background:#1e1e1e;color:#f14c4c;font-family:Segoe UI,sans-serif;padding:16px;'>$error</body></html>"
-                    return@invokeLater
+                    pane.text = "<html><body style='background:#1e1e1e;color:#f14c4c;font-family:Segoe UI,sans-serif;padding:16px;'>${error.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")}</body></html>"
+                    return@runOnEdtIfAlive
                 }
                 if (contests.isEmpty()) {
                     pane.text = "<html><body style='background:#1e1e1e;color:#cccccc;font-family:Segoe UI,sans-serif;padding:16px;'>No upcoming contests found.</body></html>"
-                    return@invokeLater
+                    return@runOnEdtIfAlive
                 }
-                fun esc(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                fun esc(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;")
                 fun fmtCountdown(sec: Long): String {
                     val d = sec / 86400
                     val h = (sec % 86400) / 3600
@@ -2897,7 +3237,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                             "<td>${esc(c.name)}</td>" +
                             "<td style='color:#73c991;font-weight:bold;'>${fmtCountdown(c.startsInSeconds)}</td>" +
                             "<td>${fmtDur(c.durationSeconds)}</td>" +
-                            "<td><a style='color:#4ea1f3;' href='${c.url}'>Register</a></td>" +
+                            "<td><a style='color:#4ea1f3;' href='${esc(c.url)}'>Register</a></td>" +
                             "</tr>"
                     )
                 }
@@ -2925,30 +3265,46 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
     private fun navigateToCfProblem(cfRef: CfProblemRef, targetIndex: String, knownName: String?) {
         val targetUrl = "${cfRef.problemBaseUrl}$targetIndex"
         val root = project.basePath?.let { Path.of(it) } ?: return
-        val searchDir = activeCppFile?.parent ?: root
+        val activeDir = activeCppFile?.parent ?: root
+        val candidateDirs = linkedSetOf<Path>()
+        if (FolderOrganizerService.effectiveMode(settings) != "flat") {
+            runCatching {
+                val previewDest = FolderOrganizerService.resolveDestination(root, "Problem $targetIndex", currentProblem.group, targetUrl, settings)
+                candidateDirs.add(previewDest.directory)
+            }
+        }
+        candidateDirs.add(activeDir)
 
         // 1. If a local .cpp file for this problem already exists, open it in CLion ONLY (no browser tab!)
         val existing = runCatching {
             val prefix = "${targetIndex}_"
             val exact = "$targetIndex.cpp"
             val probPrefix = "Problem_$targetIndex"
-            Files.list(searchDir).use { stream ->
-                stream.filter { p ->
-                    if (!Files.isRegularFile(p)) return@filter false
-                    val name = p.fileName.toString()
-                    (name.endsWith(".cpp", true) || name.endsWith(".cc", true)) &&
-                        (name.startsWith(prefix, true) || name.equals(exact, true) || name.startsWith(probPrefix, true))
-                }.findFirst().orElse(null)
+            val cidShort = cfRef.contestId?.let { "${it}${targetIndex}.cpp" }
+            val cidFullPrefix = cfRef.contestId?.let { "${it}_${targetIndex}_" }
+            candidateDirs.firstNotNullOfOrNull { dir ->
+                if (!Files.isDirectory(dir)) return@firstNotNullOfOrNull null
+                Files.list(dir).use { stream ->
+                    stream.filter { p ->
+                        if (!Files.isRegularFile(p)) return@filter false
+                        val name = p.fileName.toString()
+                        (name.endsWith(".cpp", true) || name.endsWith(".cc", true)) && (
+                            name.startsWith(prefix, true) ||
+                                name.equals(exact, true) ||
+                                name.startsWith(probPrefix, true) ||
+                                (cidShort != null && name.equals(cidShort, true)) ||
+                                (cidFullPrefix != null && name.startsWith(cidFullPrefix, true))
+                            )
+                    }.findFirst().orElse(null)
+                }
             }
         }.getOrNull()
 
         if (existing != null) {
-            ApplicationManager.getApplication().invokeLater {
-                LocalFileSystem.getInstance().refreshAndFindFileByNioFile(existing)?.let { vFile ->
-                    project.getService(FileEditorManager::class.java).openFile(vFile, true)
-                }
-                loadCppFile(existing)
+            if (openedProblemUrls.add(targetUrl)) {
+                BrowserUtil.browse(targetUrl)
             }
+            openFileInEditorAsync(existing) { loadCppFile(existing) }
             return
         }
 
@@ -2959,7 +3315,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
 
         CodeforcesVerdictService.fetchProblemFromWeb(targetUrl, fallbackTitle) { fetched ->
             if (fetched.problemNotFound) {
-                ApplicationManager.getApplication().invokeLater {
+                runOnEdtIfAlive {
                     // Mark current problem as the last problem in this sheet/contest!
                     currentCfNav = currentCfNav?.copy(nextIndex = null, nextName = null, isLast = true)
                     liveVerdict = LiveVerdictUpdate("Reached the end — this is the last problem in this contest/sheet!", "INFO", isFinal = true)
@@ -2970,7 +3326,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
 
             // If Cloudflare blocked AND we don't have a verified problem name from API, do NOT create a bogus empty file
             if (fetched.blockedByCloudflare && knownName.isNullOrBlank()) {
-                ApplicationManager.getApplication().invokeLater {
+                runOnEdtIfAlive {
                     if (openedProblemUrls.add(targetUrl)) {
                         BrowserUtil.browse(targetUrl)
                     }
@@ -2982,10 +3338,9 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
 
             val rawName = fetched.name
             val dest = FolderOrganizerService.resolveDestination(root, rawName, currentProblem.group, targetUrl, settings)
-            val targetDir = if (FolderOrganizerService.effectiveMode(settings) != "flat" && searchDir != root) searchDir else dest.directory
+            val targetDir = dest.directory
             val fileName = dest.fileName
             val cppFile = targetDir.resolve(fileName)
-            val relPath = root.relativize(cppFile).toString().replace('\\', '/')
 
             runCatching {
                 if (!Files.exists(cppFile)) {
@@ -2998,7 +3353,10 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                         .replace("\$time", timeStr)
                     Files.writeString(cppFile, code + "\n", StandardCharsets.UTF_8)
                 }
-                CMakeSyncService.registerPluginFile(root, dest.cmakeTargetHint, relPath)
+                val relPath = runCatching { root.relativize(cppFile).toString().replace('\\', '/') }.getOrNull()
+                if (relPath != null && !relPath.startsWith("..")) {
+                    CMakeSyncService.registerPluginFile(root, dest.cmakeTargetHint, relPath)
+                }
                 val tests = fetched.tests.ifEmpty { listOf(TestCase(input = "", output = "")) }.toMutableList()
                 val problem = ProblemData(
                     name = rawName,
@@ -3013,15 +3371,12 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 CphStorage.saveProblem(root, cppFile, problem)
             }
 
-            ApplicationManager.getApplication().invokeLater {
+            runOnEdtIfAlive {
                 if (openedProblemUrls.add(targetUrl)) {
                     BrowserUtil.browse(targetUrl)
                 }
                 CMakeSyncService.triggerCMakeReload(root, project)
-                LocalFileSystem.getInstance().refreshAndFindFileByNioFile(cppFile)?.let { vFile ->
-                    project.getService(FileEditorManager::class.java).openFile(vFile, true)
-                }
-                loadCppFile(cppFile)
+                openFileInEditorAsync(cppFile) { loadCppFile(cppFile) }
                 liveVerdict = if (fetched.blockedByCloudflare) {
                     LiveVerdictUpdate("Created $fileName (click + in Companion to sync tests)", "INFO", isFinal = true)
                 } else {
@@ -3047,14 +3402,30 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
 
         val baseName = cppFile.fileName.toString().substringBeforeLast('.')
         val sanitized = baseName.replace(Regex("[^a-zA-Z0-9_\\-]"), "_")
+        val folderTag = cppFile.parent?.fileName?.toString().orEmpty()
+            .replace(Regex("[^a-zA-Z0-9_]"), "_")
+            .take(20)
+            .trim('_')
+        val folderPrefixed = if (folderTag.isNotEmpty() && !sanitized.startsWith(folderTag, true)) {
+            "${folderTag}_$sanitized"
+        } else {
+            sanitized
+        }
         val runManager = RunManager.getInstance(project)
         val match = runManager.allSettings.firstOrNull { cfg ->
-            cfg.name.equals(baseName, ignoreCase = true) ||
+            cfg.name.equals(folderPrefixed, ignoreCase = true) ||
+                cfg.name.equals(baseName, ignoreCase = true) ||
                 cfg.name.equals(sanitized, ignoreCase = true) ||
                 cfg.name.equals("prob_$sanitized", ignoreCase = true)
+        } ?: runManager.allSettings.firstOrNull { cfg ->
+            cfg.name.endsWith("_$sanitized", ignoreCase = true)
         }
 
         if (match == null) {
+            val relPath = runCatching { root.relativize(cppFile).toString().replace('\\', '/') }.getOrNull()
+            if (relPath != null && !relPath.startsWith("..")) {
+                CMakeSyncService.registerPluginFile(root, folderPrefixed, relPath)
+            }
             CMakeSyncService.triggerCMakeReload(root, project)
             JOptionPane.showMessageDialog(
                 this,
@@ -3093,7 +3464,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         for (i in 0 until maxLines) {
             val e = expLines.getOrNull(i)
             val r = recLines.getOrNull(i)
-            val same = (e?.trimEnd() == r?.trimEnd()) && (e != null && r != null)
+            val same = (e != null && r != null) && (if (settings.ignoreTrailingSpaces) e.trimEnd() == r.trimEnd() else e == r)
             if (same) {
                 rows.append("<tr><td class='ln'>${i + 1}</td><td class='same'>${esc(e.orEmpty())}</td><td class='same'>${esc(r.orEmpty())}</td></tr>")
             } else {
@@ -3159,7 +3530,10 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
 
     fun runAllTests() {
         val root = project.basePath?.let { Path.of(it) } ?: return
-        val cppFile = activeCppFile ?: return
+        val cppFile = activeCppFile ?: run {
+            JOptionPane.showMessageDialog(this, "Open a C++ (.cpp) file first to run LionCPH testcases.", "LionCPH", JOptionPane.INFORMATION_MESSAGE)
+            return
+        }
         if (!hasProblem) {
             currentProblem = CphStorage.createLocalProblem(root, cppFile)
             hasProblem = true
@@ -3173,7 +3547,10 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
 
         val problemSnapshot = currentProblem.copy(tests = currentProblem.tests.map { it.copy() }.toMutableList())
         val testsSnapshot = problemSnapshot.tests.toList()
-        if (testsSnapshot.isEmpty()) return
+        if (testsSnapshot.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "No testcases yet — click '+ New Testcase' first.", "LionCPH", JOptionPane.INFORMATION_MESSAGE)
+            return
+        }
 
         cancelFlag.set(false)
         setRunningState(true)
@@ -3182,13 +3559,13 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         renderUi()
 
         ApplicationManager.getApplication().executeOnPooledThread {
-            val compileOutcome = JudgeService.compile(root, cppFile, settings)
+            val compileOutcome = JudgeService.compile(root, cppFile, settings, cancelFlag, activeProcesses)
             if (cancelFlag.get()) {
-                ApplicationManager.getApplication().invokeLater { setRunningState(false); renderUi() }
+                runOnEdtIfAlive { setRunningState(false); renderUi() }
                 return@executeOnPooledThread
             }
             if (!compileOutcome.success || compileOutcome.binaryPath == null) {
-                ApplicationManager.getApplication().invokeLater {
+                runOnEdtIfAlive {
                     setRunningState(false)
                     if (activeCppFile == cppFile) {
                         compileError = compileOutcome.stderr
@@ -3199,12 +3576,10 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 return@executeOnPooledThread
             }
 
-            val poolSize = minOf(4, testsSnapshot.size).coerceAtLeast(1)
-            val pool = Executors.newFixedThreadPool(poolSize)
             val remaining = AtomicInteger(testsSnapshot.size)
 
             testsSnapshot.forEach { tc ->
-                pool.submit {
+                testRunExecutor.submit {
                     try {
                         val result = JudgeService.runTestCase(
                             compileOutcome.binaryPath,
@@ -3220,14 +3595,21 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                         }
                     } finally {
                         val left = remaining.decrementAndGet()
-                        ApplicationManager.getApplication().invokeLater {
-                            if (left == 0) setRunningState(false)
+                        runOnEdtIfAlive {
+                            if (left == 0) {
+                                setRunningState(false)
+                                if (activeCppFile == cppFile && testsSnapshot.isNotEmpty() &&
+                                    testsSnapshot.all { currentResults[it.id]?.status == "AC" }
+                                ) {
+                                    stopwatchRunning = false
+                                    refreshTimerBarLabels()
+                                }
+                            }
                             if (activeCppFile == cppFile) renderUi()
                         }
                     }
                 }
             }
-            pool.shutdown()
         }
     }
 
@@ -3247,13 +3629,13 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         renderUi()
 
         ApplicationManager.getApplication().executeOnPooledThread {
-            val compileOutcome = JudgeService.compile(root, cppFile, settings)
+            val compileOutcome = JudgeService.compile(root, cppFile, settings, cancelFlag, activeProcesses)
             if (cancelFlag.get()) {
-                ApplicationManager.getApplication().invokeLater { setRunningState(false); renderUi() }
+                runOnEdtIfAlive { setRunningState(false); renderUi() }
                 return@executeOnPooledThread
             }
             if (!compileOutcome.success || compileOutcome.binaryPath == null) {
-                ApplicationManager.getApplication().invokeLater {
+                runOnEdtIfAlive {
                     setRunningState(false)
                     if (activeCppFile == cppFile) {
                         compileError = compileOutcome.stderr
@@ -3272,7 +3654,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 cancelFlag,
                 activeProcesses
             )
-            ApplicationManager.getApplication().invokeLater {
+            runOnEdtIfAlive {
                 setRunningState(false)
                 if (activeCppFile == cppFile) {
                     currentResults[tc.id] = result
@@ -3284,8 +3666,19 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
     }
 
     private fun saveAllDocuments() {
-        ApplicationManager.getApplication().invokeAndWait {
-            FileDocumentManager.getInstance().saveAllDocuments()
+        val app = ApplicationManager.getApplication()
+        runCatching {
+            if (app.isDispatchThread) {
+                app.runWriteAction {
+                    FileDocumentManager.getInstance().saveAllDocuments()
+                }
+            } else {
+                app.invokeAndWait {
+                    app.runWriteAction {
+                        FileDocumentManager.getInstance().saveAllDocuments()
+                    }
+                }
+            }
         }
     }
 
@@ -3299,11 +3692,13 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
     }
 
     override fun dispose() {
+        isPanelDisposed = true
         uiTickTimer.stop()
-        CodeforcesVerdictService.stopPolling()
-        saveDebounceTimer.stop()
+        CodeforcesVerdictService.stopPolling(verdictSessionKey)
         flushPendingSave()
+        saveDebounceTimer.stop()
         stopRunningTests()
+        runCatching { testRunExecutor.shutdownNow() }
         LionCPHToolWindowFactory.panels.remove(project)
         val remaining = LionCPHToolWindowFactory.panels.values.firstOrNull()
         if (remaining == null) {

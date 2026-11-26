@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "com.lioncph"
-version = "1.9.4"
+version = "1.9.5"
 
 repositories {
     mavenCentral()
@@ -21,13 +21,17 @@ dependencies {
     }
 
     implementation("com.google.code.gson:gson:2.13.2")
+    testImplementation(kotlin("test"))
 }
 
 kotlin {
-    jvmToolchain(25)
+    jvmToolchain(21)
 }
 
 tasks {
+    test {
+        useJUnitPlatform()
+    }
     withType<JavaCompile>().configureEach {
         sourceCompatibility = "21"
         targetCompatibility = "21"

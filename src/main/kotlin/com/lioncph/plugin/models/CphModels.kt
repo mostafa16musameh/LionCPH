@@ -5,6 +5,7 @@ import com.google.gson.GsonBuilder
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.UUID
 
@@ -55,8 +56,8 @@ data class CphSettings(
     var floatTolerance: Double = 0.0, // used when mode == "custom"
     var ignoreTrailingSpaces: Boolean = true,
     var autoSyncCMake: Boolean = true,
-    var organizeByContest: Boolean = false,
-    var organizationMode: String = "flat", // "flat", "single", "hierarchy"
+    var organizeByContest: Boolean = true,
+    var organizationMode: String = "hierarchy", // "flat", "single", "hierarchy"
     var fileNameStyle: String = "full",    // "full" (H_Two_numbers.cpp), "short" (H.cpp)
     var cfHandle: String = "",
     var cfApiKey: String = "",
@@ -95,6 +96,35 @@ data class SnippetLibrary(
 
 object CphStorage {
     private val gson: Gson = GsonBuilder().setPrettyPrinting().create()
+    private val secretFileLock = Any()
+
+    private fun writeFileAtomically(target: Path, content: String, restrictPosixPerms: Boolean = false) {
+        val parent = target.parent
+        if (parent != null) Files.createDirectories(parent)
+        val tmp = (parent ?: Path.of(".")).resolve(".${target.fileName}.${UUID.randomUUID()}.tmp")
+        try {
+            Files.writeString(tmp, content, StandardCharsets.UTF_8)
+            if (restrictPosixPerms) {
+                runCatching {
+                    val perms = java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")
+                    Files.setPosixFilePermissions(tmp, perms)
+                }
+            }
+            try {
+                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            } catch (_: Exception) {
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING)
+            }
+            if (restrictPosixPerms) {
+                runCatching {
+                    val perms = java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")
+                    Files.setPosixFilePermissions(target, perms)
+                }
+            }
+        } finally {
+            runCatching { Files.deleteIfExists(tmp) }
+        }
+    }
 
     private fun cphDir(projectRoot: Path): Path = projectRoot.resolve(".cph")
 
@@ -110,43 +140,6 @@ object CphStorage {
         return cphDir(projectRoot).resolve(".${fileName}_$hash.prob")
     }
 
-    /**
-     * Resolves the target directory for an imported problem when organizeByContest is enabled:
-     * - Codeforces Group/Sheet -> sanitized sheet/group folder
-     * - Codeforces Contest -> sanitized contest folder
-     * - Problemset / standalone practice -> Practice/
-     */
-    fun resolveTargetDir(projectRoot: Path, group: String, url: String, settings: CphSettings): Path {
-        if (!settings.organizeByContest) return projectRoot
-
-        val folderName = when {
-            url.contains("/problemset/", ignoreCase = true) -> "Practice"
-            group.isNotBlank() && !group.equals("local", ignoreCase = true) && !group.equals("Competitive Companion", ignoreCase = true) -> {
-                // If group has "Community - Sheet #1 ...", prefer the specific sheet/contest part after " - "
-                val specific = if (group.contains(" - ")) group.substringAfter(" - ").trim() else group.trim()
-                specific.replace(Regex("[^a-zA-Z0-9_\\- ]"), "")
-                    .trim()
-                    .replace(Regex("\\s+"), "_")
-                    .take(42)
-                    .trim('_')
-                    .ifBlank { "Contest" }
-            }
-            url.contains("/contest/", ignoreCase = true) -> {
-                val cid = Regex("""/contest/(\d+)""").find(url)?.groupValues?.get(1)
-                if (cid != null) "Contest_$cid" else "Contests"
-            }
-            url.contains("/gym/", ignoreCase = true) -> {
-                val gid = Regex("""/gym/(\d+)""").find(url)?.groupValues?.get(1)
-                if (gid != null) "Gym_$gid" else "Gym"
-            }
-            else -> "Practice"
-        }
-
-        val target = projectRoot.resolve(folderName)
-        Files.createDirectories(target)
-        return target
-    }
-
     fun loadProblemOrNull(projectRoot: Path, cppFile: Path): ProblemData? {
         val probFile = problemFileFor(projectRoot, cppFile)
         if (Files.isRegularFile(probFile)) {
@@ -156,19 +149,28 @@ object CphStorage {
                 if (parsed != null) return sanitizeProblem(parsed)
             }
         }
+        // Safe fallback: only match another .prob with same filename if its recorded srcPath matches this exact file
+        val normalizedTarget = cppFile.toAbsolutePath().normalize()
         val dir = cphDir(projectRoot)
         if (Files.isDirectory(dir)) {
             val prefix = ".${cppFile.fileName}_"
             runCatching {
                 Files.list(dir).use { stream ->
-                    val match = stream.filter {
+                    val candidates = stream.filter {
                         val n = it.fileName.toString()
                         n.startsWith(prefix) && n.endsWith(".prob")
-                    }.findFirst()
-                    if (match.isPresent) {
-                        val json = Files.readString(match.get(), StandardCharsets.UTF_8)
-                        val parsed = gson.fromJson(json, ProblemData::class.java)
-                        if (parsed != null) return sanitizeProblem(parsed)
+                    }.toList()
+                    for (cand in candidates) {
+                        val parsed = runCatching {
+                            gson.fromJson(Files.readString(cand, StandardCharsets.UTF_8), ProblemData::class.java)
+                        }.getOrNull() ?: continue
+                        val safeParsed = sanitizeProblem(parsed)
+                        val candSrc = safeParsed.srcPath.takeIf { it.isNotBlank() }?.let {
+                            runCatching { Path.of(it).toAbsolutePath().normalize() }.getOrNull()
+                        }
+                        if (candSrc == normalizedTarget) {
+                            return safeParsed
+                        }
                     }
                 }
             }
@@ -195,23 +197,12 @@ object CphStorage {
         Files.createDirectories(dir)
         problem.srcPath = cppFile.toAbsolutePath().toString()
         val probFile = problemFileFor(projectRoot, cppFile)
-        Files.writeString(probFile, gson.toJson(problem), StandardCharsets.UTF_8)
+        writeFileAtomically(probFile, gson.toJson(problem), restrictPosixPerms = false)
     }
 
     fun deleteProblem(projectRoot: Path, cppFile: Path) {
         val dir = cphDir(projectRoot)
         runCatching { Files.deleteIfExists(problemFileFor(projectRoot, cppFile)) }
-        if (Files.isDirectory(dir)) {
-            val prefix = ".${cppFile.fileName}_"
-            runCatching {
-                Files.list(dir).use { stream ->
-                    stream.filter {
-                        val n = it.fileName.toString()
-                        n.startsWith(prefix) && n.endsWith(".prob")
-                    }.forEach { runCatching { Files.deleteIfExists(it) } }
-                }
-            }
-        }
         val baseName = cppFile.fileName.toString().substringBeforeLast(".")
         val pathHash = (cppFile.toAbsolutePath().normalize().toString().hashCode().toUInt()).toString(16)
         val binDir = dir.resolve("bin")
@@ -327,7 +318,7 @@ while (lo < hi) {
             runCatching {
                 val json = Files.readString(file, StandardCharsets.UTF_8)
                 val parsed = gson.fromJson(json, SnippetLibrary::class.java)
-                if (parsed?.snippets != null && parsed.snippets.isNotEmpty()) {
+                if (parsed?.snippets != null) {
                     return parsed.snippets.filter { it.name != null && it.code != null }.toMutableList()
                 }
             }
@@ -343,22 +334,70 @@ while (lo < hi) {
 
     fun settingsFile(projectRoot: Path): Path = cphDir(projectRoot).resolve("lioncph_settings.json")
 
+    private fun userSecretsFile(): Path {
+        val home = System.getProperty("user.home").orEmpty().ifBlank { "." }
+        return Path.of(home, ".lioncph", "secrets.json")
+    }
+
+    private data class UserSecrets(var cfApiSecret: String = "")
+
+    private fun loadUserSecret(): String = synchronized(secretFileLock) {
+        val file = userSecretsFile()
+        if (!Files.isRegularFile(file)) return ""
+        return runCatching {
+            val parsed = gson.fromJson(Files.readString(file, StandardCharsets.UTF_8), UserSecrets::class.java)
+            parsed?.cfApiSecret.orEmpty()
+        }.getOrDefault("")
+    }
+
+    private fun saveUserSecret(secret: String): Boolean = synchronized(secretFileLock) {
+        return runCatching {
+            val file = userSecretsFile()
+            writeFileAtomically(file, gson.toJson(UserSecrets(secret)), restrictPosixPerms = true)
+            true
+        }.getOrDefault(false)
+    }
+
     fun loadSettings(projectRoot: Path): CphSettings {
         val file = settingsFile(projectRoot)
         if (Files.isRegularFile(file)) {
             runCatching {
                 val json = Files.readString(file, StandardCharsets.UTF_8)
                 val parsed = gson.fromJson(json, CphSettings::class.java)
-                if (parsed != null) return sanitizeSettings(parsed, json)
+                if (parsed != null) {
+                    val sanitized = sanitizeSettings(parsed, json)
+                    if (sanitized.cfApiSecret.isNotBlank()) {
+                        // Auto-migrate legacy plaintext secret out of project repo into ~/.lioncph/secrets.json
+                        // Only strip from project settings after the new secret is confirmed persisted.
+                        if (saveUserSecret(sanitized.cfApiSecret)) {
+                            saveSettings(projectRoot, sanitized, updateSecret = false)
+                        }
+                    } else {
+                        sanitized.cfApiSecret = loadUserSecret()
+                    }
+                    return sanitized
+                }
             }
         }
-        return CphSettings()
+        return CphSettings(cfApiSecret = loadUserSecret())
     }
 
-    fun saveSettings(projectRoot: Path, settings: CphSettings) {
-        val dir = cphDir(projectRoot)
-        Files.createDirectories(dir)
-        Files.writeString(settingsFile(projectRoot), gson.toJson(settings), StandardCharsets.UTF_8)
+    /**
+     * Persists project settings (always stripping cfApiSecret from project-local JSON).
+     * When [updateSecret] is true, atomically updates ~/.lioncph/secrets.json and returns false if secret persistence fails
+     * (never silently discarding a write failure and never corrupting a previously stored secret).
+     */
+    fun saveSettings(projectRoot: Path, settings: CphSettings, updateSecret: Boolean = false): Boolean {
+        var secretOk = true
+        if (updateSecret) {
+            secretOk = saveUserSecret(settings.cfApiSecret)
+        }
+        val projectOk = runCatching {
+            val sanitizedForProject = settings.copy(cfApiSecret = "")
+            writeFileAtomically(settingsFile(projectRoot), gson.toJson(sanitizedForProject), restrictPosixPerms = false)
+            true
+        }.getOrDefault(false)
+        return secretOk && projectOk
     }
 
     @Suppress("SENSELESS_COMPARISON")
@@ -392,7 +431,7 @@ while (lo < hi) {
         if (s.floatToleranceMode == null || s.floatToleranceMode !in setOf("auto", "exact", "custom")) s.floatToleranceMode = "auto"
         if (s.floatTolerance.isNaN() || s.floatTolerance < 0.0) s.floatTolerance = 0.0
         if (s.defaultTimeLimitMs <= 0L) s.defaultTimeLimitMs = defaults.defaultTimeLimitMs
-        if (s.companionPort <= 0) s.companionPort = defaults.companionPort
+        if (s.companionPort !in 1..65535) s.companionPort = defaults.companionPort
         if (!rawJson.contains("autoSyncCMake")) s.autoSyncCMake = true
         if (!rawJson.contains("ignoreTrailingSpaces")) s.ignoreTrailingSpaces = true
         if (!rawJson.contains("setOnlineJudge")) s.setOnlineJudge = true

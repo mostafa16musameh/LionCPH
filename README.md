@@ -10,13 +10,13 @@
 
 ## Features
 
-- **Dual Sticky Timer & Problem Notes:** Pinned top header with a per-problem **Solve Stopwatch** (auto-pauses on `AC`), a **Contest / Virtual / Sheet Countdown** (`2:00h`, `2:30h`, `3:00h`, `5:00h ICPC`, or custom minutes), and auto-saved **Problem Notes** for upsolving.
+- **Dual Sticky Timer & Problem Notes:** Pinned top header with a per-problem **Solve Stopwatch** (auto-pauses on `AC`), a **Contest / Virtual / Sheet Countdown** (`1:30h`, `2:00h`, `2:30h`, `3:00h`, `5:00h ICPC`, or custom `HH:MM:SS` / minutes), and auto-saved **Problem Notes** for upsolving.
 - **CP Snippets, Float Tolerance & Pre-Submit Guard:** Insert classic C++ templates (`DSU`, `Segment Tree`, `Sieve`, `Dijkstra`, `modPow`, + custom snippets) right at your cursor, toggle **Float ε (`1e-6` / `1e-9`)** comparison, batch-import **`.in`/`.out` testcase folders**, and catch unprotected `freopen`/`endl`/debug prints before submitting.
 - **Modern Native Judge Panel:** Sleek dark interface with rounded cards, **Collapse All / Expand All**, auto-collapsing passed testcases, execution time (`ms`) & peak memory (`MB`/`KB`) pills, `Copy` / `Set` helpers, and smooth 2x mouse-wheel scrolling.
 - **Fast Parallel Judging, Sanitizers & One-Click Debug TC:** Compiles once with smart compiler discovery (CLion bundled MinGW, MSYS2, `g++` / `clang++`), caches unchanged builds, executes testcases in parallel with an instant **Stop** button, toggles **ASan/UBSan** (or `-D_GLIBCXX_DEBUG` on MinGW), and launches CLion's native Debugger preloaded with any failing testcase via the purple **Debug TC** button.
 - **Side-by-Side Colored Visual Diff & Diagnostics:** Detailed diff viewer for Wrong Answer, scrollable Compilation Error panel with Copy, `TLE` / `MLE` detection, `512 KB` output capping, and human-readable crash diagnostics (`SIGSEGV`, `Stack Overflow`, `SIGFPE`, `SIGABRT`).
 - **Full Codeforces Hub inside CLion:**
-  - **Live Verdicts** (~1.1s polling with smart 503 backoff and optional `CF API Key` / `Secret` for private/group sheets like ICPC Assiut).
+  - **Live Verdicts** (per-project isolated ~2.2s rate-limit-safe polling with smart backoff and isolated user-scoped `CF API Key` / `Secret` storage for private/group sheets like ICPC Assiut).
   - **Prev / Standings / Next Navigator** with automatic end-of-sheet detection (`Last Problem`) and zero duplicate browser tabs.
   - **In-IDE `CF Subs`** (latest 15 submissions) and **`Contests`** (upcoming rounds with live countdown).
   - **Smart Codeforces Submit:** Matches your CLion/CMake C++ standard (`G++23` / `G++20` / `G++17`), works both with and without [cph-submit](https://chromewebstore.google.com/detail/cph-submit/ekplnobooikgpdbobcciehbhcmlklgnc).
@@ -40,10 +40,10 @@
 ```bash
 git clone https://github.com/mostafa16musameh/LionCPH.git
 cd LionCPH
-./gradlew clean buildPlugin
+./gradlew clean test buildPlugin
 ```
 
-The installable plugin archive will be generated at `build/distributions/LionCPH-1.9.4.zip`.
+The installable plugin archive will be generated at `build/distributions/LionCPH-1.9.5.zip`.
 
 ---
 
