@@ -609,7 +609,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 }
                 val vFile = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(cppFile)
                 if (vFile != null) {
-                    FileEditorManager.getInstance(project).openFile(vFile, true)
+                    project.getService(FileEditorManager::class.java).openFile(vFile, true)
                 }
                 loadCppFile(cppFile)
             }
@@ -627,7 +627,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 }
                 val vFile = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(cppFile)
                 if (vFile != null) {
-                    FileEditorManager.getInstance(project).openFile(vFile, true)
+                    project.getService(FileEditorManager::class.java).openFile(vFile, true)
                 }
                 loadCppFile(cppFile)
             }
@@ -636,7 +636,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
 
     private fun syncActiveEditorFile() {
         ApplicationManager.getApplication().invokeLater {
-            val file = FileEditorManager.getInstance(project).selectedFiles.firstOrNull()
+            val file = project.getService(FileEditorManager::class.java).selectedFiles.firstOrNull()
             if (file != null && isCppFile(file.extension)) {
                 loadCppFile(Path.of(file.path))
             } else {
@@ -1555,8 +1555,10 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 currentProblem.useCustomChecker = true
                 currentProblem.customCheckerPath = pathField.text
                 saveActiveProblem()
-                LocalFileSystem.getInstance().refreshAndFindFileByNioFile(sampleFile)?.let {
-                    FileEditorManager.getInstance(project).openFile(it, true)
+                ApplicationManager.getApplication().invokeLater {
+                    LocalFileSystem.getInstance().refreshAndFindFileByNioFile(sampleFile)?.let {
+                        project.getService(FileEditorManager::class.java).openFile(it, true)
+                    }
                 }
                 renderUi()
             }
@@ -2110,7 +2112,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         val submitExt = if (CompanionServerService.isCphSubmitExtensionActive()) "Connected" else "Not detected (Direct Browser mode)"
         val mode = FolderOrganizerService.effectiveMode(settings)
         val msg = buildString {
-            appendLine("LionCPH v1.9.2 — Competitive Programming Helper for CLion")
+            appendLine("LionCPH v1.9.3 — Competitive Programming Helper for CLion")
             appendLine("By Mostafa Musameh  |  Shortcut: Ctrl + Alt + B (Run All)")
             appendLine("QA & Testing Contributor: Tariq Khalid (@Tariq4824) — Thank you!")
             appendLine()
@@ -2225,7 +2227,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         if (chosenCode.isBlank()) return
 
         if (picked == 0) {
-            val editor = FileEditorManager.getInstance(project).selectedTextEditor
+            val editor = project.getService(FileEditorManager::class.java).selectedTextEditor
             if (editor != null) {
                 WriteCommandAction.runWriteCommandAction(project) {
                     val offset = editor.caretModel.offset
@@ -2462,7 +2464,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 CMakeSyncService.triggerCMakeReload(root, project)
                 ApplicationManager.getApplication().invokeLater {
                     LocalFileSystem.getInstance().refreshAndFindFileByNioFile(imported.first)?.let {
-                        FileEditorManager.getInstance(project).openFile(it, true)
+                        project.getService(FileEditorManager::class.java).openFile(it, true)
                     }
                 }
                 loadCppFile(imported.first)
@@ -2840,10 +2842,12 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         }.getOrNull()
 
         if (existing != null) {
-            LocalFileSystem.getInstance().refreshAndFindFileByNioFile(existing)?.let { vFile ->
-                FileEditorManager.getInstance(project).openFile(vFile, true)
+            ApplicationManager.getApplication().invokeLater {
+                LocalFileSystem.getInstance().refreshAndFindFileByNioFile(existing)?.let { vFile ->
+                    project.getService(FileEditorManager::class.java).openFile(vFile, true)
+                }
+                loadCppFile(existing)
             }
-            loadCppFile(existing)
             return
         }
 
@@ -2914,7 +2918,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 }
                 CMakeSyncService.triggerCMakeReload(root, project)
                 LocalFileSystem.getInstance().refreshAndFindFileByNioFile(cppFile)?.let { vFile ->
-                    FileEditorManager.getInstance(project).openFile(vFile, true)
+                    project.getService(FileEditorManager::class.java).openFile(vFile, true)
                 }
                 loadCppFile(cppFile)
                 liveVerdict = if (fetched.blockedByCloudflare) {
@@ -2990,7 +2994,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             val r = recLines.getOrNull(i)
             val same = (e?.trimEnd() == r?.trimEnd()) && (e != null && r != null)
             if (same) {
-                rows.append("<tr><td class='ln'>${i + 1}</td><td class='same'>${esc(e!!)}</td><td class='same'>${esc(r!!)}</td></tr>")
+                rows.append("<tr><td class='ln'>${i + 1}</td><td class='same'>${esc(e.orEmpty())}</td><td class='same'>${esc(r.orEmpty())}</td></tr>")
             } else {
                 val (eHtml, rHtml) = highlightCharDiff(e ?: "<EOF>", r ?: "<EOF>")
                 rows.append("<tr><td class='ln'>${i + 1}</td><td class='exp'>$eHtml</td><td class='rec'>$rHtml</td></tr>")

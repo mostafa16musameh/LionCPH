@@ -142,7 +142,7 @@ object CodeforcesVerdictService {
         val req = HttpRequest.newBuilder()
             .uri(URI.create(url))
             .timeout(Duration.ofSeconds(timeoutSec))
-            .header("User-Agent", "LionCPH/1.9.2")
+            .header("User-Agent", "LionCPH/1.9.3")
             .GET()
             .build()
         return httpClient.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
