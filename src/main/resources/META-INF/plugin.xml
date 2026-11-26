@@ -16,6 +16,7 @@
 
     <change-notes><![CDATA[
         <ul>
+            <li><b>1.9.4:</b> Distinct color coding for Contest Timers (Green for <b>LIVE</b> CF sync, Cyan for <b>VIRT</b> sync, Violet for manual timers), clearer <b>Turn Off / Reset Timer</b> option (also available after TIME UP!), automatic hands-free re-sync when starting a Virtual or when a <code>BEFORE</code> contest starts, a subtle dismissible in-panel Marketplace update notifier, and thread-safe problem snapshots during parallel test runs.</li>
             <li><b>1.9.3:</b> Fixed binary compatibility across <b>CLion 2024.2 – 2026.2</b> (replaced <code>FileEditorManager.getInstance(project)</code> with <code>project.getService(FileEditorManager::class.java)</code> to eliminate <code>FileEditorManager.Companion</code> errors on pre-2026.3 builds).</li>
             <li><b>1.9.2:</b> Safe red Trash button — offers <b>Clear Results Only</b> (keeps all testcases) or <b>Delete Problem</b> with an automatic backup and a 1-click <b>Restore Deleted Problem</b> button so testcases are never accidentally lost.</li>
             <li><b>1.9.1:</b> Pinned sticky bottom Control Dock (<code>+ New Testcase</code>, <code>Submit</code>, <code>Judge Options</code>, 3x3 Tools Grid, <code>Note</code>, and <code>Run All</code>) right at the bottom of the panel so the center zone is dedicated purely to scrolling testcases with zero empty dead space.</li>

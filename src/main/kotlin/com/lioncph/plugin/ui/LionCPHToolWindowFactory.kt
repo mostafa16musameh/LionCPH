@@ -1,5 +1,6 @@
 package com.lioncph.plugin.ui
 
+import com.google.gson.JsonParser
 import com.intellij.execution.ProgramRunnerUtil
 import com.intellij.execution.RunManager
 import com.intellij.execution.executors.DefaultDebugExecutor
@@ -58,7 +59,12 @@ import java.awt.RenderingHints
 import java.awt.datatransfer.StringSelection
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 import java.nio.charset.StandardCharsets
+import java.time.Duration
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
@@ -102,7 +108,54 @@ class LionCPHToolWindowFactory : ToolWindowFactory {
     }
 
     companion object {
+        const val CURRENT_VERSION = "1.9.4"
+        const val MARKETPLACE_URL = "https://plugins.jetbrains.com/plugin/36278-lioncph"
+        private const val MARKETPLACE_UPDATES_API = "https://plugins.jetbrains.com/api/plugins/36278/updates?size=1"
         val panels = ConcurrentHashMap<Project, LionCPHPanel>()
+        private val updateCheckStarted = AtomicBoolean(false)
+        @Volatile var latestMarketplaceVersion: String? = null
+
+        fun checkMarketplaceUpdateOnce(onFoundNewer: () -> Unit) {
+            if (!updateCheckStarted.compareAndSet(false, true)) {
+                if (latestMarketplaceVersion != null) onFoundNewer()
+                return
+            }
+            ApplicationManager.getApplication().executeOnPooledThread {
+                runCatching {
+                    val client = HttpClient.newBuilder()
+                        .connectTimeout(Duration.ofSeconds(4))
+                        .followRedirects(HttpClient.Redirect.NORMAL)
+                        .build()
+                    val req = HttpRequest.newBuilder()
+                        .uri(URI.create(MARKETPLACE_UPDATES_API))
+                        .timeout(Duration.ofSeconds(4))
+                        .header("User-Agent", "LionCPH/$CURRENT_VERSION")
+                        .GET()
+                        .build()
+                    val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
+                    if (resp.statusCode() != 200) return@runCatching
+                    val arr = JsonParser.parseString(resp.body()).asJsonArray
+                    if (arr.size() == 0) return@runCatching
+                    val remoteVer = arr[0].asJsonObject.get("version")?.asString?.trim().orEmpty()
+                    if (remoteVer.isNotBlank() && compareSemVer(remoteVer, CURRENT_VERSION) > 0) {
+                        latestMarketplaceVersion = remoteVer
+                        ApplicationManager.getApplication().invokeLater { onFoundNewer() }
+                    }
+                }
+            }
+        }
+
+        private fun compareSemVer(a: String, b: String): Int {
+            val pa = a.split(".").map { it.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
+            val pb = b.split(".").map { it.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
+            val len = maxOf(pa.size, pb.size)
+            for (i in 0 until len) {
+                val va = pa.getOrElse(i) { 0 }
+                val vb = pb.getOrElse(i) { 0 }
+                if (va != vb) return va.compareTo(vb)
+            }
+            return 0
+        }
     }
 }
 
@@ -398,6 +451,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
     private val deletedProblemBackups: MutableMap<Path, ProblemData> = ConcurrentHashMap()
     private var checkerExpanded = false
     private var judgeOptionsExpanded = false
+    private var updateBannerDismissed = false
 
     @Volatile private var isRunning = false
     private val cancelFlag = AtomicBoolean(false)
@@ -416,6 +470,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
     private var contestModeTag: String = "" // "LIVE", "VIRT", "STARTS", "CUSTOM"
     private var contestLabelName: String = ""
     private var syncedContestId: Int? = null
+    private var lastAutoSyncAttemptMs: Long = 0L
 
     private val stopwatchBtn = FlatCphButton("00:00", CphColors.BTN_DARK, CphColors.BTN_DARK_BORDER).apply {
         font = Font("JetBrains Mono", Font.BOLD, 10)
@@ -487,12 +542,19 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                 contestPausedRemainingSec = 0L
                 if (!contestEndAlerted) {
                     contestEndAlerted = true
-                    val msg = if (contestModeTag == "STARTS") {
-                        "${contestLabelName.ifBlank { "Contest" }} has started!"
+                    val wasBefore = (contestModeTag == "STARTS")
+                    val msg = if (wasBefore) {
+                        "${contestLabelName.ifBlank { "Contest" }} has started! Syncing LIVE timer..."
                     } else {
                         "Time's up! ${contestLabelName.ifBlank { "Contest" }} timer finished."
                     }
-                    liveVerdict = LiveVerdictUpdate(msg, if (contestModeTag == "STARTS") "OK" else "FAIL", isFinal = true)
+                    liveVerdict = LiveVerdictUpdate(msg, if (wasBefore) "OK" else "FAIL", isFinal = true)
+                    if (wasBefore) {
+                        currentCfRef?.let { ref ->
+                            syncedContestId = null
+                            syncContestTimerWithCodeforces(ref, showFeedback = false)
+                        }
+                    }
                     renderUi()
                 }
             }
@@ -593,6 +655,9 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
 
         startCompanionListener(settings.companionPort)
         syncActiveEditorFile()
+        LionCPHToolWindowFactory.checkMarketplaceUpdateOnce {
+            if (!updateBannerDismissed) renderUi()
+        }
     }
 
     private fun isCppFile(ext: String?): Boolean {
@@ -672,7 +737,11 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
 
         val ref = currentCfRef
         if (ref != null && ref.contestId != null && targetFile != null) {
-            if (contestModeTag != "CUSTOM" && syncedContestId != ref.contestId) {
+            val nowMs = System.currentTimeMillis()
+            val shouldAutoSync = contestModeTag != "CUSTOM" &&
+                (syncedContestId != ref.contestId || (!contestRunning && (nowMs - lastAutoSyncAttemptMs) > 30_000L))
+            if (shouldAutoSync) {
+                lastAutoSyncAttemptMs = nowMs
                 syncContestTimerWithCodeforces(ref, showFeedback = false)
             }
             CodeforcesVerdictService.fetchNavigationInfo(ref, settings.cfApiKey, settings.cfApiSecret) { nav ->
@@ -965,6 +1034,32 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         }
         stickyTopPanel.revalidate()
         stickyTopPanel.repaint()
+
+        val newerVer = LionCPHToolWindowFactory.latestMarketplaceVersion
+        if (newerVer != null && !updateBannerDismissed) {
+            val updPanel = JPanel(BorderLayout(6, 0)).apply {
+                background = Color(0x1D, 0x2A, 0x3A)
+                border = BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(Color(0x2E, 0x6B, 0x9E)),
+                    JBUI.Borders.empty(5, 8)
+                )
+                alignmentX = Component.LEFT_ALIGNMENT
+                maximumSize = Dimension(Int.MAX_VALUE, 34)
+            }
+            val updLink = linkLabel("Update available: LionCPH v$newerVer — Click to update") {
+                BrowserUtil.browse(LionCPHToolWindowFactory.MARKETPLACE_URL)
+            }.apply {
+                foreground = Color(0x75, 0xBE, 0xFF)
+                font = Font("Segoe UI", Font.BOLD, 11)
+            }
+            updPanel.add(updLink, BorderLayout.CENTER)
+            updPanel.add(linkLabel("x") {
+                updateBannerDismissed = true
+                renderUi()
+            }, BorderLayout.EAST)
+            contentStack.add(updPanel)
+            contentStack.add(Box.createVerticalStrut(8))
+        }
 
         liveVerdict?.let { lv ->
             val (bg, bd, fg) = when (lv.state) {
@@ -1895,10 +1990,12 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             contestTimerBtn.text = "$tag ${formatHms(rem)}"
             contestTimerBtn.foreground = when {
                 !contestRunning -> CphColors.MUTED
-                contestModeTag == "STARTS" -> CphColors.GREEN_TEXT
                 rem <= 300L -> CphColors.RED_TEXT
                 rem <= 900L -> CphColors.AMBER
-                else -> Color(0x75, 0xBE, 0xFF)
+                contestModeTag == "LIVE" -> CphColors.GREEN_TEXT
+                contestModeTag == "VIRT" -> Color(0x56, 0xD4, 0xDD)
+                contestModeTag == "STARTS" -> CphColors.AMBER
+                else -> Color(0xC2, 0x97, 0xFF) // Distinct violet for manual/custom timer
             }
             contestTimerBtn.toolTipText = "${contestLabelName.ifBlank { "Contest Timer" }} ($tag) — click to Sync, Pause, or Change"
         } else if (contestEndAlerted) {
@@ -2037,8 +2134,10 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         }
         val rem = currentContestRemainingSec()
         if (rem > 0L) {
-            options.add(if (contestRunning) "Pause Countdown" else "Resume Countdown")
-            options.add("Clear Countdown")
+            options.add(if (contestRunning) "Pause Timer" else "Resume Timer")
+        }
+        if (rem > 0L || contestEndAlerted || contestModeTag.isNotEmpty()) {
+            options.add("Turn Off / Reset Timer")
         }
         options.add("2:00h (CF Div.2 / Div.3)")
         options.add("2:30h (CF Div.1 / Div.2)")
@@ -2063,18 +2162,18 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                     syncContestTimerWithCodeforces(cfRef, showFeedback = true)
                 }
             }
-            "Pause Countdown" -> {
+            "Pause Timer" -> {
                 contestPausedRemainingSec = currentContestRemainingSec()
                 contestRunning = false
                 contestEndEpochMs = 0L
             }
-            "Resume Countdown" -> {
+            "Resume Timer" -> {
                 if (contestPausedRemainingSec > 0L) {
                     contestEndEpochMs = System.currentTimeMillis() + contestPausedRemainingSec * 1000L
                     contestRunning = true
                 }
             }
-            "Clear Countdown" -> {
+            "Turn Off / Reset Timer" -> {
                 contestEndEpochMs = 0L
                 contestPausedRemainingSec = 0L
                 contestRunning = false
@@ -2112,7 +2211,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         val submitExt = if (CompanionServerService.isCphSubmitExtensionActive()) "Connected" else "Not detected (Direct Browser mode)"
         val mode = FolderOrganizerService.effectiveMode(settings)
         val msg = buildString {
-            appendLine("LionCPH v1.9.3 — Competitive Programming Helper for CLion")
+            appendLine("LionCPH v${LionCPHToolWindowFactory.CURRENT_VERSION} — Competitive Programming Helper for CLion")
             appendLine("By Mostafa Musameh  |  Shortcut: Ctrl + Alt + B (Run All)")
             appendLine("QA & Testing Contributor: Tariq Khalid (@Tariq4824) — Thank you!")
             appendLine()
@@ -2371,6 +2470,8 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             settings.cfApiKey = cfApiKeyField.text.trim()
             settings.cfApiSecret = cfApiSecretField.text.trim()
             CodeforcesVerdictService.clearProblemsCache()
+            syncedContestId = null
+            lastAutoSyncAttemptMs = 0L
             settings.pythonPath = pythonField.text.trim().ifBlank { "python3" }
             settings.ignoreTrailingSpaces = trimBox.isSelected
             settings.autoSyncCMake = autoCMakeBox.isSelected
@@ -3070,7 +3171,8 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         flushPendingSave()
         saveAllDocuments()
 
-        val testsSnapshot = currentProblem.tests.toList()
+        val problemSnapshot = currentProblem.copy(tests = currentProblem.tests.map { it.copy() }.toMutableList())
+        val testsSnapshot = problemSnapshot.tests.toList()
         if (testsSnapshot.isEmpty()) return
 
         cancelFlag.set(false)
@@ -3107,7 +3209,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
                         val result = JudgeService.runTestCase(
                             compileOutcome.binaryPath,
                             tc,
-                            currentProblem,
+                            problemSnapshot,
                             settings,
                             cancelFlag,
                             activeProcesses
@@ -3133,7 +3235,8 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
         val root = project.basePath?.let { Path.of(it) } ?: return
         val cppFile = activeCppFile ?: return
         if (isRunning) return
-        val tc = currentProblem.tests.find { it.id == testId } ?: return
+        val problemSnapshot = currentProblem.copy(tests = currentProblem.tests.map { it.copy() }.toMutableList())
+        val tc = problemSnapshot.tests.find { it.id == testId } ?: return
         flushPendingSave()
         saveAllDocuments()
 
@@ -3164,7 +3267,7 @@ class LionCPHPanel(private val project: Project) : JPanel(BorderLayout()), Dispo
             val result = JudgeService.runTestCase(
                 compileOutcome.binaryPath,
                 tc,
-                currentProblem,
+                problemSnapshot,
                 settings,
                 cancelFlag,
                 activeProcesses

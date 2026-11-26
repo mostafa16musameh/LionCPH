@@ -43,7 +43,7 @@ cd LionCPH
 ./gradlew clean buildPlugin
 ```
 
-The installable plugin archive will be generated at `build/distributions/LionCPH-1.9.3.zip`.
+The installable plugin archive will be generated at `build/distributions/LionCPH-1.9.4.zip`.
 
 ---
 
